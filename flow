@@ -1,0 +1,481 @@
+# Aurora PostgreSQL via RDS Proxy
+## IAM Roles, Policies & Authentication Flow
+
+---
+
+## 1. Application/Service Layer
+**Lambda, EC2, ECS, or other compute service**
+
+### IAM Role (Application Role)
+
+**Trust Policy:**
+- Service principal: `lambda.amazonaws.com`, `ec2.amazonaws.com`, `ecs-tasks.amazonaws.com`, etc.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "lambda.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+```
+
+### Permission Policies
+
+#### Option A: IAM Authentication Policy
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["rds-db:connect"],
+      "Resource": "arn:aws:rds-db:region:account-id:dbuser:prxy-PROXY_ID/username"
+    }
+  ]
+}
+```
+
+#### Option B: Secrets Manager Policy
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:GetSecretValue"
+      ],
+      "Resource": "arn:aws:secretsmanager:region:account-id:secret:secret-name-*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["kms:Decrypt"],
+      "Resource": "arn:aws:kms:region:account-id:key/key-id",
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": "secretsmanager.region.amazonaws.com"
+        }
+      }
+    }
+  ]
+}
+```
+
+### Application Actions
+
+**🔑 Generates IAM Authentication Token**
+- Token validity: 15 minutes
+- Method: `auth.BuildAuthToken(endpoint, region, username, credentials)`
+- Token is used as the password in the database connection string
+
+```go
+authToken, err := auth.BuildAuthToken(
+    ctx,
+    "proxy-endpoint.proxy-xxx.region.rds.amazonaws.com:5432",
+    "us-east-1",
+    "db_username",
+    cfg.Credentials,
+)
+```
+
+---
+
+## 2. RDS Proxy Layer
+**Connection pooling & authentication gateway**
+
+### IAM Role (Proxy Role)
+
+**Trust Policy:**
+- Service principal: `rds.amazonaws.com`
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "rds.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+```
+
+### Secrets Manager Access Policy
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:GetSecretValue",
+        "secretsmanager:DescribeSecret"
+      ],
+      "Resource": "arn:aws:secretsmanager:region:account-id:secret:secret-name-*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["kms:Decrypt"],
+      "Resource": "arn:aws:kms:region:account-id:key/key-id",
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": "secretsmanager.region.amazonaws.com"
+        }
+      }
+    }
+  ]
+}
+```
+
+### RDS Proxy Actions
+
+✅ **Validates IAM authentication token**
+- Checks token signature and validity
+- Verifies token hasn't expired (15-minute window)
+
+✅ **Checks rds-db:connect permission**
+- Ensures the caller has proper IAM permissions
+
+✅ **Retrieves database credentials from Secrets Manager**
+- Uses its IAM role to access secrets
+- Decrypts credentials using KMS
+
+✅ **Manages connection pooling**
+- Multiplexes application connections
+- Reduces database connection overhead
+
+---
+
+## 3. Aurora PostgreSQL Layer
+**Database cluster**
+
+### Database Configuration Requirements
+
+#### IAM Authentication Must Be Enabled
+```bash
+aws rds modify-db-instance \
+  --db-instance-identifier mydbinstance \
+  --enable-iam-database-authentication \
+  --apply-immediately
+```
+
+#### Database User Must Have rds_iam Role
+```sql
+-- Connect as master user
+CREATE USER db_username;
+GRANT rds_iam TO db_username;
+
+-- Grant necessary database permissions
+GRANT CONNECT ON DATABASE mydb TO db_username;
+GRANT USAGE ON SCHEMA public TO db_username;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO db_username;
+```
+
+### Aurora Actions
+
+✅ **Validates authentication via AWS**
+- Verifies IAM token through AWS authentication service
+
+✅ **Establishes database connection**
+- Creates session for authenticated user
+
+✅ **Enforces PostgreSQL permissions**
+- Applies database-level grants and restrictions
+
+---
+
+## Network Security (Security Groups)
+
+### RDS Proxy Security Group
+- **Inbound Rules:**
+  - Protocol: TCP
+  - Port: 5432
+  - Source: Application Security Group ID
+
+- **Outbound Rules:**
+  - Protocol: TCP
+  - Port: 5432
+  - Destination: Aurora Security Group ID
+
+### Aurora PostgreSQL Security Group
+- **Inbound Rules:**
+  - Protocol: TCP
+  - Port: 5432
+  - Source: RDS Proxy Security Group ID
+
+---
+
+## Complete Authentication Flow
+
+```
+┌─────────────────────┐
+│   Application       │
+│  (Lambda/EC2/ECS)   │
+│                     │
+│  1. Generate token  │
+│     using IAM creds │
+└──────────┬──────────┘
+           │
+           │ Connection with token
+           │ as password
+           ▼
+┌─────────────────────┐
+│    RDS Proxy        │
+│                     │
+│  2. Validate token  │
+│  3. Check IAM perms │
+│  4. Get DB creds    │
+│     from Secrets    │
+└──────────┬──────────┘
+           │
+           │ Authenticated connection
+           ▼
+┌─────────────────────┐
+│  Aurora PostgreSQL  │
+│                     │
+│  5. Validate auth   │
+│  6. Establish conn  │
+│  7. Execute queries │
+└─────────────────────┘
+```
+
+---
+
+## Key Points
+
+### 🔐 Token Generation
+- **Done by the application**, not by RDS Proxy or database
+- Application uses AWS SDK to generate tokens
+- Tokens are cryptographically signed using AWS credentials
+
+### ⏱️ Token Validity
+- Tokens are valid for **15 minutes** only
+- Must regenerate tokens for long-running connections
+- Consider implementing token refresh logic
+
+### 🔑 RDS Proxy Role Requirements
+- Needs `secretsmanager:GetSecretValue` permission
+- Needs `kms:Decrypt` permission for encrypted secrets
+- Trust relationship with `rds.amazonaws.com`
+
+### 🛡️ Application Role Requirements
+- **For IAM Auth:** Needs `rds-db:connect` permission
+- **For Secrets Manager Auth:** Needs `secretsmanager:GetSecretValue` permission
+- Trust relationship with appropriate service principal
+
+### 💾 Database Setup
+- Must enable IAM authentication at instance level
+- Must grant `rds_iam` role to database users
+- Database users still need regular PostgreSQL grants
+
+### 🚫 Security Best Practices
+- Use least-privilege IAM policies
+- Restrict secret access to specific ARNs
+- Enable encryption in transit (SSL/TLS)
+- Rotate database credentials regularly
+- Use VPC endpoints for private connectivity
+- Monitor CloudWatch logs for authentication failures
+
+---
+
+## Go Code Example
+
+### IAM Authentication
+
+```go
+package main
+
+import (
+    "context"
+    "database/sql"
+    "fmt"
+    "time"
+    
+    "github.com/aws/aws-sdk-go-v2/config"
+    "github.com/aws/aws-sdk-go-v2/feature/rds/auth"
+    _ "github.com/lib/pq"
+)
+
+func connectWithIAM() (*sql.DB, error) {
+    ctx := context.Background()
+    
+    // Load AWS configuration
+    cfg, err := config.LoadDefaultConfig(ctx)
+    if err != nil {
+        return nil, fmt.Errorf("failed to load config: %w", err)
+    }
+    
+    // Generate authentication token
+    endpoint := "your-proxy-endpoint.proxy-xxx.us-east-1.rds.amazonaws.com:5432"
+    region := "us-east-1"
+    username := "db_username"
+    
+    authToken, err := auth.BuildAuthToken(
+        ctx,
+        endpoint,
+        region,
+        username,
+        cfg.Credentials,
+    )
+    if err != nil {
+        return nil, fmt.Errorf("failed to build auth token: %w", err)
+    }
+    
+    // Build connection string
+    dsn := fmt.Sprintf(
+        "host=%s port=%d user=%s password=%s dbname=%s sslmode=require",
+        "your-proxy-endpoint.proxy-xxx.us-east-1.rds.amazonaws.com",
+        5432,
+        username,
+        authToken,
+        "postgres",
+    )
+    
+    // Open database connection
+    db, err := sql.Open("postgres", dsn)
+    if err != nil {
+        return nil, fmt.Errorf("failed to open database: %w", err)
+    }
+    
+    // Test connection
+    if err := db.Ping(); err != nil {
+        return nil, fmt.Errorf("failed to ping database: %w", err)
+    }
+    
+    return db, nil
+}
+
+// For long-running applications, implement token refresh
+func getConnectionWithRefresh() (*sql.DB, error) {
+    db, err := connectWithIAM()
+    if err != nil {
+        return nil, err
+    }
+    
+    // Set connection pool settings
+    db.SetMaxOpenConns(25)
+    db.SetMaxIdleConns(5)
+    db.SetConnMaxLifetime(14 * time.Minute) // Refresh before 15-min expiry
+    
+    return db, nil
+}
+```
+
+### Secrets Manager Authentication
+
+```go
+package main
+
+import (
+    "context"
+    "database/sql"
+    "encoding/json"
+    "fmt"
+    
+    "github.com/aws/aws-sdk-go-v2/aws"
+    "github.com/aws/aws-sdk-go-v2/config"
+    "github.com/aws/aws-sdk-go-v2/service/secretsmanager"
+    _ "github.com/lib/pq"
+)
+
+type DBSecret struct {
+    Username string `json:"username"`
+    Password string `json:"password"`
+    Engine   string `json:"engine"`
+    Host     string `json:"host"`
+    Port     int    `json:"port"`
+    DBName   string `json:"dbname"`
+}
+
+func connectWithSecretsManager() (*sql.DB, error) {
+    ctx := context.Background()
+    
+    // Load AWS configuration
+    cfg, err := config.LoadDefaultConfig(ctx)
+    if err != nil {
+        return nil, fmt.Errorf("failed to load config: %w", err)
+    }
+    
+    // Get secret from Secrets Manager
+    client := secretsmanager.NewFromConfig(cfg)
+    result, err := client.GetSecretValue(ctx, &secretsmanager.GetSecretValueInput{
+        SecretId: aws.String("your-db-secret"),
+    })
+    if err != nil {
+        return nil, fmt.Errorf("failed to get secret: %w", err)
+    }
+    
+    // Parse secret
+    var secret DBSecret
+    if err := json.Unmarshal([]byte(*result.SecretString), &secret); err != nil {
+        return nil, fmt.Errorf("failed to parse secret: %w", err)
+    }
+    
+    // Build connection string (using proxy endpoint)
+    dsn := fmt.Sprintf(
+        "host=%s port=%d user=%s password=%s dbname=%s sslmode=require",
+        "your-proxy-endpoint.proxy-xxx.us-east-1.rds.amazonaws.com",
+        5432,
+        secret.Username,
+        secret.Password,
+        secret.DBName,
+    )
+    
+    // Open database connection
+    db, err := sql.Open("postgres", dsn)
+    if err != nil {
+        return nil, fmt.Errorf("failed to open database: %w", err)
+    }
+    
+    // Test connection
+    if err := db.Ping(); err != nil {
+        return nil, fmt.Errorf("failed to ping database: %w", err)
+    }
+    
+    return db, nil
+}
+```
+
+---
+
+## Troubleshooting Common Issues
+
+### Token Expired Error
+**Symptom:** `authentication token has expired`
+**Solution:** Regenerate token. Tokens are only valid for 15 minutes.
+
+### Access Denied Error
+**Symptom:** `User not authorized to perform: rds-db:connect`
+**Solution:** Check IAM policy has correct resource ARN with proxy ID.
+
+### Connection Timeout
+**Symptom:** Connection hangs or times out
+**Solution:** Verify security group rules allow traffic on port 5432.
+
+### IAM Authentication Not Enabled
+**Symptom:** `IAM authentication is disabled for this instance`
+**Solution:** Enable IAM authentication on Aurora cluster/instance.
+
+### User Not Found
+**Symptom:** `password authentication failed for user`
+**Solution:** Grant `rds_iam` role to database user: `GRANT rds_iam TO username;`
+
+---
+
+## Additional Resources
+
+- [AWS RDS Proxy Documentation](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/rds-proxy.html)
+- [IAM Database Authentication](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/UsingWithRDS.IAMDBAuth.html)
+- [AWS SDK for Go v2](https://aws.github.io/aws-sdk-go-v2/docs/)
+- [RDS Proxy Best Practices](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/rds-proxy-planning.html)
