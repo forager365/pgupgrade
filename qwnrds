@@ -1,0 +1,547 @@
+You are an AWS engineer using AWS CDK Typescript.
+Create app using best practices of typescript, modular and object oriented.
+Create a stack to  deploy AWS RDS.
+Provide options to choose between, AWS RDS Postgres Single Instance Postgres, AWS RDS Multi A Z instance Postgres,
+AWS RDS Multi AZ Cluster Postgres or AWS Aurora Postgres.
+
+Provide option to choose what pg_extensions are needed. There are also a list of required extensions.
+
+Create app to upgrade database instance after deployment.
+
+You are an AWS engineer using AWS CDK Typescript.
+Create app using best practices of typescript, modular and object oriented.
+Create a stack to  deploy AWS RDS.
+Provide options to choose between, AWS RDS Postgres Single Instance Postgres, AWS RDS Multi A Z instance Postgres,
+AWS RDS Multi AZ Cluster Postgres or AWS Aurora Postgres.
+
+Provide option to choose what pg_extensions are needed. There are also a list of required extensions.
+
+Create app to upgrade database instance after deployment.
+
+rds-postgres-cdk/
+├── bin/
+│   └── rds-postgres-cdk.ts          # App entrypoint
+├── lib/
+│   ├── index.ts                     # Re-export key constructs
+│   ├── rds-postgres-stack.ts        # Main stack
+│   ├── rds-config.ts                # Config types & validation
+│   └── postgres-extensions.ts       # Extension logic
+├── cdk.json
+├── package.json
+└── tsconfig.json
+
+// lib/rds-config.ts
+import * as cdk from 'aws-cdk-lib';
+
+export type DeploymentType =
+  | 'single-instance'
+  | 'multi-az-instance'
+  | 'multi-az-cluster'
+  | 'aurora-provisioned'
+  | 'aurora-serverless-v2';
+
+export interface RdsPostgresProps extends cdk.StackProps {
+  /**
+   * Deployment type. Required.
+   */
+  deploymentType: DeploymentType;
+
+  /**
+   * Engine version (e.g., '15.4', '16.1'). Required.
+   */
+  engineVersion: string;
+
+  /**
+   * Instance class (e.g., 'db.t4g.micro', 'db.r6g.large').
+   * Required for non-serverless.
+   */
+  instanceClass?: string;
+
+  /**
+   * Allocated storage in GiB (e.g., 20 for GP2/GP3). Optional.
+   */
+  allocatedStorage?: number;
+
+  /**
+   * Whether to enable deletion protection. Defaults to true.
+   */
+  deletionProtection?: boolean;
+
+  /**
+   * List of desired pg extensions (e.g., ['postgis', 'uuid-ossp', 'pg_cron'])
+   */
+  pgExtensions?: string[];
+
+  /**
+   * Database name, username, and password (via Secret)
+   */
+  dbName: string;
+  dbUsername: string;
+  dbPasswordSecretArn?: string; // Optional: use existing secret
+}
+
+--------
+// lib/rds-config.ts
+import * as cdk from 'aws-cdk-lib';
+
+export type DeploymentType =
+  | 'single-instance'
+  | 'multi-az-instance'
+  | 'multi-az-cluster'
+  | 'aurora-provisioned'
+  | 'aurora-serverless-v2';
+
+export interface RdsPostgresProps extends cdk.StackProps {
+  /**
+   * Deployment type. Required.
+   */
+  deploymentType: DeploymentType;
+
+  /**
+   * Engine version (e.g., '15.4', '16.1'). Required.
+   */
+  engineVersion: string;
+
+  /**
+   * Instance class (e.g., 'db.t4g.micro', 'db.r6g.large').
+   * Required for non-serverless.
+   */
+  instanceClass?: string;
+
+  /**
+   * Allocated storage in GiB (e.g., 20 for GP2/GP3). Optional.
+   */
+  allocatedStorage?: number;
+
+  /**
+   * Whether to enable deletion protection. Defaults to true.
+   */
+  deletionProtection?: boolean;
+
+  /**
+   * List of desired pg extensions (e.g., ['postgis', 'uuid-ossp', 'pg_cron'])
+   */
+  pgExtensions?: string[];
+
+  /**
+   * Database name, username, and password (via Secret)
+   */
+  dbName: string;
+  dbUsername: string;
+  dbPasswordSecretArn?: string; // Optional: use existing secret
+}
+---------
+// lib/rds-postgres-stack.ts
+import * as cdk from 'aws-cdk-lib';
+import * as rds from 'aws-cdk-lib/aws-rds';
+import * as ec2 from 'aws-cdk-lib/aws-ec2';
+import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
+import * as iam from 'aws-cdk-lib/aws-iam';
+import { Construct } from 'constructs';
+import { RdsPostgresProps, DeploymentType } from './rds-config';
+import { validateExtensions } from './postgres-extensions';
+
+export class RdsPostgresStack extends cdk.Stack {
+  public readonly clusterOrInstance: rds.DatabaseCluster | rds.DatabaseInstance;
+  public readonly credentialsSecret: secretsmanager.ISecret;
+
+  constructor(scope: Construct, id: string, props: RdsPostgresProps) {
+    super(scope, id, props);
+
+    const {
+      deploymentType,
+      engineVersion,
+      instanceClass,
+      allocatedStorage = 20,
+      deletionProtection = true,
+      pgExtensions = [],
+      dbName,
+      dbUsername,
+      dbPasswordSecretArn,
+    } = props;
+
+    // 🔐 Secret
+    const dbSecret = dbPasswordSecretArn
+      ? secretsmanager.Secret.fromSecretCompleteArn(this, 'DbSecret', dbPasswordSecretArn)
+      : new secretsmanager.Secret(this, 'DbCredentialsSecret', {
+          secretName: `${id}-db-credentials`,
+          generateSecretString: {
+            secretStringTemplate: JSON.stringify({ username: dbUsername }),
+            generateStringKey: 'password',
+            excludePunctuation: true,
+            passwordLength: 16,
+          },
+        });
+
+    this.credentialsSecret = dbSecret;
+
+    // 🌐 VPC (best practice: isolated subnets or private)
+    const vpc = new ec2.Vpc(this, 'RdsVpc', {
+      maxAzs: 3,
+      natGateways: 1,
+    });
+
+    // 🔌 Security Group
+    const dbSecurityGroup = new ec2.SecurityGroup(this, 'DbSecurityGroup', {
+      vpc,
+      description: 'RDS PostgreSQL access',
+      allowAllOutbound: true,
+    });
+    // 🔒 Lock down inbound (e.g. only from app SG or bastion) — for demo, open to VPC
+    dbSecurityGroup.addIngressRule(ec2.Peer.ipv4(vpc.vpcCidrBlock), ec2.Port.tcp(5432));
+
+    // 🛠️ Engine
+    const engine = rds.DatabaseClusterEngine.auroraPostgres({
+      version: rds.AuroraPostgresEngineVersion.of(engineVersion, engineVersion),
+    });
+
+    const postgresEngine = rds.DatabaseInstanceEngine.postgres({
+      version: rds.PostgresEngineVersion.of(engineVersion, engineVersion),
+    });
+
+    // ✅ Extensions
+    const extensions = validateExtensions(pgExtensions);
+
+    // 🏗️ Construct selection
+    let clusterOrInstance: rds.DatabaseCluster | rds.DatabaseInstance;
+
+    switch (deploymentType) {
+      case 'single-instance':
+        if (!instanceClass) throw new Error('instanceClass required for single-instance');
+        clusterOrInstance = new rds.DatabaseInstance(this, 'PostgresInstance', {
+          engine: postgresEngine,
+          vpc,
+          vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+          securityGroups: [dbSecurityGroup],
+          instanceType: ec2.InstanceType.of(
+            ec2.InstanceClass[instanceClass.split('.')[1].toUpperCase() as keyof typeof ec2.InstanceClass],
+            ec2.InstanceSize[instanceClass.split('.')[2].toUpperCase() as keyof typeof ec2.InstanceSize]
+          ),
+          allocatedStorage,
+          databaseName: dbName,
+          credentials: rds.Credentials.fromSecret(dbSecret),
+          deletionProtection,
+          publiclyAccessible: false,
+          enablePerformanceInsights: true,
+          parameterGroup: new rds.ParameterGroup(this, 'ParamGroup', {
+            engine: postgresEngine,
+            parameters: {
+              shared_preload_libraries: extensions.join(','),
+            },
+          }),
+        });
+        break;
+
+      case 'multi-az-instance':
+        if (!instanceClass) throw new Error('instanceClass required for multi-az-instance');
+        clusterOrInstance = new rds.DatabaseInstance(this, 'PostgresMultiAzInstance', {
+          engine: postgresEngine,
+          vpc,
+          vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+          securityGroups: [dbSecurityGroup],
+          instanceType: ec2.InstanceType.of(
+            ec2.InstanceClass[instanceClass.split('.')[1].toUpperCase() as keyof typeof ec2.InstanceClass],
+            ec2.InstanceSize[instanceClass.split('.')[2].toUpperCase() as keyof typeof ec2.InstanceSize]
+          ),
+          multiAz: true,
+          allocatedStorage,
+          databaseName: dbName,
+          credentials: rds.Credentials.fromSecret(dbSecret),
+          deletionProtection,
+          publiclyAccessible: false,
+          enablePerformanceInsights: true,
+          parameterGroup: new rds.ParameterGroup(this, 'ParamGroupMultiAz', {
+            engine: postgresEngine,
+            parameters: {
+              shared_preload_libraries: extensions.join(','),
+            },
+          }),
+        });
+        break;
+
+      case 'multi-az-cluster': // RDS Multi-AZ DB Cluster (not Aurora)
+        if (!instanceClass) throw new Error('instanceClass required for multi-az-cluster');
+        clusterOrInstance = new rds.DatabaseCluster(this, 'PostgresMultiAzCluster', {
+          engine: postgresEngine,
+          clusterIdentifier: `${id}-multi-az-cluster`,
+          instances: 2,
+          instanceProps: {
+            instanceType: ec2.InstanceType.of(
+              ec2.InstanceClass[instanceClass.split('.')[1].toUpperCase() as keyof typeof ec2.InstanceClass],
+              ec2.InstanceSize[instanceClass.split('.')[2].toUpperCase() as keyof typeof ec2.InstanceSize]
+            ),
+            vpc,
+            vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+            securityGroups: [dbSecurityGroup],
+          },
+          defaultDatabaseName: dbName,
+          credentials: rds.Credentials.fromSecret(dbSecret),
+          storageType: rds.StorageType.AURORA_IOPT1,
+          deletionProtection,
+          parameterGroup: new rds.ParameterGroup(this, 'ParamGroupCluster', {
+            engine: postgresEngine,
+            parameters: {
+              shared_preload_libraries: extensions.join(','),
+            },
+          }),
+        });
+        break;
+
+      case 'aurora-provisioned':
+        clusterOrInstance = new rds.DatabaseCluster(this, 'AuroraPostgresCluster', {
+          engine,
+          instances: 2,
+          instanceProps: {
+            instanceType: instanceClass
+              ? ec2.InstanceType.of(
+                  ec2.InstanceClass[instanceClass.split('.')[1].toUpperCase() as keyof typeof ec2.InstanceClass],
+                  ec2.InstanceSize[instanceClass.split('.')[2].toUpperCase() as keyof typeof ec2.InstanceSize]
+                )
+              : ec2.InstanceType.of(ec2.InstanceClass.T4G, ec2.InstanceSize.MEDIUM),
+            vpc,
+            vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+            securityGroups: [dbSecurityGroup],
+          },
+          defaultDatabaseName: dbName,
+          credentials: rds.Credentials.fromSecret(dbSecret),
+          deletionProtection,
+          parameterGroup: new rds.ParameterGroup(this, 'AuroraParamGroup', {
+            engine,
+            parameters: {
+              shared_preload_libraries: extensions.join(','),
+            },
+          }),
+        });
+        break;
+
+      case 'aurora-serverless-v2':
+        clusterOrInstance = new rds.ServerlessCluster(this, 'AuroraServerlessCluster', {
+          engine,
+          vpc,
+          vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+          securityGroups: [dbSecurityGroup],
+          defaultDatabaseName: dbName,
+          credentials: rds.Credentials.fromSecret(dbSecret),
+          deletionProtection,
+          scaling: {
+            autoPause: cdk.Duration.minutes(30),
+            minCapacity: rds.AuroraCapacityUnit.ACU_0_5,
+            maxCapacity: rds.AuroraCapacityUnit.ACU_8,
+          },
+          parameterGroup: new rds.ParameterGroup(this, 'AuroraServerlessParamGroup', {
+            engine,
+            parameters: {
+              shared_preload_libraries: extensions.join(','),
+            },
+          }),
+        });
+        break;
+
+      default:
+        throw new Error(`Unsupported deploymentType: ${deploymentType}`);
+    }
+
+    this.clusterOrInstance = clusterOrInstance;
+
+    // 🛠️ Custom Resource: Apply extensions *after* DB is ready
+    // (Optional — many extensions auto-load via shared_preload_libraries, but CREATE EXTENSION may still be needed)
+    if (extensions.length > 0) {
+      this.addExtensionsInitializer(extensions, dbSecret, dbName, dbUsername);
+    }
+
+    // 📦 Outputs
+    new cdk.CfnOutput(this, 'EndpointAddress', {
+      value: clusterOrInstance instanceof rds.DatabaseCluster
+        ? clusterOrInstance.clusterEndpoint.hostname
+        : clusterOrInstance.instanceEndpoint.hostname,
+    });
+    new cdk.CfnOutput(this, 'SecretArn', { value: dbSecret.secretArn });
+  }
+
+  private addExtensionsInitializer(
+    extensions: string[],
+    secret: secretsmanager.ISecret,
+    dbName: string,
+    dbUser: string
+  ) {
+    // Use a Custom Resource Lambda (or use RDS Data API if enabled)
+    // For production: deploy a Lambda + IAM role to run CREATE EXTENSION
+    // For simplicity, we’ll demonstrate via CDK context-triggered upgrade (see bin)
+
+    // 👉 In real world: use AwsCustomResource or custom provider
+    // See: https://docs.aws.amazon.com/cdk/api/v2/docs/aws-cdk-lib.custom-resources.AwsCustomResource.html
+
+    // For now: log required manual steps
+    new cdk.CfnResource(this, 'ExtensionsNote', {
+      type: 'Custom::ExtensionsNote',
+      properties: {
+        Message: `Run 'CREATE EXTENSION IF NOT EXISTS <ext>;' for: ${extensions.join(', ')}`,
+        DBName: dbName,
+        DBUser: dbUser,
+      },
+    });
+  }
+}
+--------------
+// bin/rds-postgres-cdk.ts
+#!/usr/bin/env node
+import 'source-map-support/register';
+import * as cdk from 'aws-cdk-lib';
+import { RdsPostgresStack } from '../lib/rds-postgres-stack';
+import { DeploymentType } from '../lib/rds-config';
+
+const app = new cdk.App();
+
+// 🔁 Use CDK context for flexible deployments & upgrades
+const deploymentType = app.node.tryGetContext('deploymentType') as DeploymentType || 'single-instance';
+const engineVersion = app.node.tryGetContext('engineVersion') || '15.4';
+const instanceClass = app.node.tryGetContext('instanceClass') || 'db.t4g.micro';
+const pgExtensions = (app.node.tryGetContext('pgExtensions') as string[]) || [];
+const dbName = app.node.tryGetContext('dbName') || 'myapp';
+const dbUsername = app.node.tryGetContext('dbUsername') || 'admin';
+
+new RdsPostgresStack(app, 'RdsPostgresStack', {
+  deploymentType,
+  engineVersion,
+  instanceClass,
+  pgExtensions,
+  dbName,
+  dbUsername,
+  /* pass dbPasswordSecretArn for rotation/upgrade */
+});
+
+app.synth();
+---------
+cdk deploy RdsPostgresStack \
+  --context deploymentType=single-instance \
+  --context engineVersion=15.4 \
+  --context instanceClass=db.t4g.micro \
+  --context pgExtensions='["postgis","pg_cron"]' \
+  --context dbName=myapp \
+  --context dbUsername=admin
+---------
+cdk deploy RdsPostgresStack \
+  --context deploymentType=multi-az-instance \
+  --context engineVersion=16.1 \          # major/minor upgrade
+  --context instanceClass=db.r6g.large \  # scale up
+  --context pgExtensions='["postgis","pg_cron"]' \
+  --context dbName=myapp \
+  --context dbUsername=admin
+----
+// In DatabaseInstance/Cluster props:
+allowMajorVersionUpgrade: true,
+autoMinorVersionUpgrade: true,
+
+
+✅ CDK will automatically generate an update change set, upgrading the instance in-place (RDS handles blue/green if eligible).
+
+⚠️ Major Version Upgrades
+Ensure allowMajorVersionUpgrade: true is set (add to props & pass to RDS construct)
+Test in staging first!
+Aurora upgrades may require cluster recreation (check docs)
+Add to RdsPostgresStack where needed:
+
+
+Qwen3-Max
+5:20 PM
+Below is a modular, object-oriented, and idiomatic TypeScript AWS CDK (v2) application that satisfies your requirements:
+
+✅ Supports multiple PostgreSQL deployment types:
+Single Instance
+Multi-AZ Instance
+Multi-AZ Cluster (RDS)
+Aurora PostgreSQL (Serverless v2 or Provisioned)
+✅ Allows flexible selection of PostgreSQL extensions (with required extension enforcement)
+✅ Supports post-deployment database upgrades (e.g., version upgrade, instance resizing) via CDK context & deploy-time parameters
+📁 Project Structure
+bash
+1234567891011
+rds-postgres-cdk/
+├── bin/
+│   └── rds-postgres-cdk.ts          # App entrypoint
+├── lib/
+│   ├── index.ts                     # Re-export key constructs
+│   ├── rds-postgres-stack.ts        # Main stack
+│   ├── rds-config.ts                # Config types & validation
+│   └── postgres-extensions.ts       # Extension logic
+├── cdk.json
+├── package.json
+
+✅ 1. lib/rds-config.ts — Type-safe Config Interface & Validation
+ts
+12345678910111213141516171819202122232425262728293031323334353637383940414243444546474849
+// lib/rds-config.ts
+import * as cdk from 'aws-cdk-lib';
+
+export type DeploymentType =
+  | 'single-instance'
+  | 'multi-az-instance'
+  | 'multi-az-cluster'
+  | 'aurora-provisioned'
+  | 'aurora-serverless-v2';
+
+
+✅ 2. lib/postgres-extensions.ts — Required & Optional Extensions
+ts
+1234567891011121314151617181920212223242526272829
+✅ 3. lib/rds-postgres-stack.ts — Main Stack (Modular & OOP)
+ts
+123456789101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899100101102103104105106107108109110111112113114115116117118119120121122123124125126127128129130131132133134135136137138139140141142143144145146147148149150151152153154155156157158159160161162163164165166167168169170171172173174175176177178179180181182183184185186187188189190191192193194195196197198199200201202203204205206207208209210211212213214215216217218219220221222223224225226227228229230231232233234235236237238239240241242243244245246247248249250251
+✅ 4. bin/rds-postgres-cdk.ts — App & Upgrade Workflow
+ts
+12345678910111213141516171819202122232425262728
+// bin/rds-postgres-cdk.ts
+#!/usr/bin/env node
+import 'source-map-support/register';
+import * as cdk from 'aws-cdk-lib';
+import { RdsPostgresStack } from '../lib/rds-postgres-stack';
+import { DeploymentType } from '../lib/rds-config';
+
+const app = new cdk.App();
+
+// 🔁 Use CDK context for flexible deployments & upgrades
+
+🚀 How to Deploy & Upgrade
+📦 Initial Deploy (Single Instance, PostGIS + pg_cron)
+bash
+1234567
+🔁 Upgrade: Scale to Multi-AZ & PostgreSQL 16
+bash
+1234567
+✅ CDK will automatically generate an update change set, upgrading the instance in-place (RDS handles blue/green if eligible).
+
+⚠️ Major Version Upgrades
+Ensure allowMajorVersionUpgrade: true is set (add to props & pass to RDS construct)
+Test in staging first!
+Aurora upgrades may require cluster recreation (check docs)
+Add to RdsPostgresStack where needed:
+
+ts
+123
+✅ Best Practices Applied
+Practice
+Implementation
+Modular
+Separated config, extensions, stack
+Type-safe
+Strict RdsPostgresProps, enum for deploymentType
+Immutable Secrets
+Secrets Manager auto-gen or ARN import
+Secure by Default
+Private subnets, security groups, no public access
+Extensible
+Easy to add MySQL, Oracle, etc.
+Upgrade-ready
+Context-driven deploys avoid hardcoded values
+Validation
+Extension list validated at synthesis time
+📌 Next Steps (Production Enhancements)
+Add RDS Proxy for connection pooling
+Enable encryption-at-rest & in-transit
+Add backup retention & PITR
+Automated extension installer via AwsCustomResource + Lambda
+Parameter store for config (instead of CLI context)
+Blue/Green Deployments for zero-downtime upgrades (RDS 16+)
+Let me know if you'd like any of these implemented!
+
+Copy
