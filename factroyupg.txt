@@ -1,0 +1,821 @@
+RDS PostgreSQL 17 Upgrade Solution Using CDK Aspects
+This solution uses CDK Aspects to apply the version upgrade across all RDS PostgreSQL and Aurora PostgreSQL resources with minimal changes to your existing application.
+Solution Overview
+CDK Aspects are ideal here because they:
+
+Apply changes to all matching constructs without modifying factory/config code
+Can be conditionally enabled per environment
+Keep upgrade logic centralized and removable after migration.
+
+Implementation
+1. Create the Aspect Class
+
+// lib/aspects/postgres-upgrade-aspect.ts
+import { IAspect, Annotations } from 'aws-cdk-lib';
+import { IConstruct } from 'constructs';
+import * as rds from 'aws-cdk-lib/aws-rds';
+
+export interface PostgresUpgradeAspectProps {
+  /**
+   * Target PostgreSQL version
+   * @default '17'
+   */
+  readonly targetVersion?: string;
+
+  /**
+   * Enable the upgrade (useful for environment-specific control)
+   * @default true
+   */
+  readonly enabled?: boolean;
+
+  /**
+   * Add annotation warnings for visibility
+   * @default true
+   */
+  readonly addAnnotations?: boolean;
+}
+
+export class PostgresUpgradeAspect implements IAspect {
+  private readonly targetVersion: string;
+  private readonly enabled: boolean;
+  private readonly addAnnotations: boolean;
+
+  constructor(props: PostgresUpgradeAspectProps = {}) {
+    this.targetVersion = props.targetVersion ?? '17';
+    this.enabled = props.enabled ?? true;
+    this.addAnnotations = props.addAnnotations ?? true;
+  }
+
+  public visit(node: IConstruct): void {
+    if (!this.enabled) {
+      return;
+    }
+
+    // Handle RDS Database Instance (Single-AZ and Multi-AZ Instance)
+    if (node instanceof rds.CfnDBInstance) {
+      this.upgradeDbInstance(node);
+    }
+
+    // Handle Aurora Cluster
+    if (node instanceof rds.CfnDBCluster) {
+      this.upgradeDbCluster(node);
+    }
+  }
+
+  private upgradeDbInstance(instance: rds.CfnDBInstance): void {
+    const engine = instance.engine?.toLowerCase();
+    
+    // Only process PostgreSQL engines
+    if (!engine || !engine.includes('postgres')) {
+      return;
+    }
+
+    const instanceId = instance.dbInstanceIdentifier ?? instance.node.path;
+    const currentVersion = instance.engineVersion ?? 'unknown';
+
+    // Set target version
+    instance.engineVersion = this.targetVersion;
+
+    // Allow major version upgrade
+    instance.allowMajorVersionUpgrade = true;
+
+    // Keep existing parameter group (no change needed - it's already set)
+    // The existing dbParameterGroupName property is preserved
+
+    if (this.addAnnotations) {
+      Annotations.of(instance).addWarning(
+        `PostgreSQL upgrade scheduled: ${currentVersion} → ${this.targetVersion} for ${instanceId}`
+      );
+    }
+  }
+
+  private upgradeDbCluster(cluster: rds.CfnDBCluster): void {
+    const engine = cluster.engine?.toLowerCase();
+    
+    // Only process Aurora PostgreSQL engines
+    if (!engine || !engine.includes('aurora-postgresql')) {
+      return;
+    }
+
+    const clusterId = cluster.dbClusterIdentifier ?? cluster.node.path;
+    const currentVersion = cluster.engineVersion ?? 'unknown';
+
+    // Set target version
+    cluster.engineVersion = this.targetVersion;
+
+    // Allow major version upgrade
+    cluster.allowMajorVersionUpgrade = true;
+
+    // Keep existing parameter group (no change needed - it's already set)
+    // The existing dbClusterParameterGroupName property is preserved
+
+    if (this.addAnnotations) {
+      Annotations.of(cluster).addWarning(
+        `Aurora PostgreSQL upgrade scheduled: ${currentVersion} → ${this.targetVersion} for ${clusterId}`
+      );
+    }
+  }
+}
+
+2. Apply the Aspect in Your Stack
+
+// lib/your-existing-stack.ts (minimal changes)
+import { Stack, StackProps, Aspects } from 'aws-cdk-lib';
+import { Construct } from 'constructs';
+import { PostgresUpgradeAspect } from './aspects/postgres-upgrade-aspect';
+// ... your existing imports
+
+export interface YourStackProps extends StackProps {
+  readonly environment: 'dev' | 'test' | 'prod';
+  // ... your existing props
+}
+
+export class YourExistingStack extends Stack {
+  constructor(scope: Construct, id: string, props: YourStackProps) {
+    super(scope, id, props);
+
+    // =============================================
+    // YOUR EXISTING CODE - NO CHANGES NEEDED
+    // Factory method, config loading, RDS creation, etc.
+    // =============================================
+
+    // ... existing RDS/Aurora deployment code ...
+
+    // =============================================
+    // ADD THIS SECTION FOR VERSION UPGRADE
+    // =============================================
+    this.applyPostgresUpgrade(props.environment);
+  }
+
+  private applyPostgresUpgrade(environment: string): void {
+    // Configuration per environment
+    const upgradeConfig: Record<string, { enabled: boolean; targetVersion: string }> = {
+      dev: { enabled: true, targetVersion: '17' },
+      test: { enabled: true, targetVersion: '17' },
+      prod: { enabled: true, targetVersion: '17' },  // Set to false initially, enable after dev/test validation
+    };
+
+    const config = upgradeConfig[environment] ?? { enabled: false, targetVersion: '17' };
+
+    Aspects.of(this).add(new PostgresUpgradeAspect({
+      targetVersion: config.targetVersion,
+      enabled: config.enabled,
+      addAnnotations: true,
+    }));
+  }
+}
+
+3. Alternative: Apply at App Level
+If you prefer to apply the aspect across all stacks from the app entry point:
+
+// bin/app.ts
+import { App, Aspects } from 'aws-cdk-lib';
+import { PostgresUpgradeAspect } from '../lib/aspects/postgres-upgrade-aspect';
+import { YourExistingStack } from '../lib/your-existing-stack';
+
+const app = new App();
+const environment = app.node.tryGetContext('environment') ?? 'dev';
+
+// Your existing stack creation
+const stack = new YourExistingStack(app, `MyStack-${environment}`, {
+  environment: environment,
+  // ... other props
+});
+
+// Apply upgrade aspect based on environment
+const enableUpgrade = app.node.tryGetContext('enablePostgresUpgrade') === 'true';
+
+if (enableUpgrade) {
+  Aspects.of(app).add(new PostgresUpgradeAspect({
+    targetVersion: '17',
+    enabled: true,
+  }));
+}
+
+app.synth();
+
+----
+
+cdk deploy -c environment=dev -c enablePostgresUpgrade=true
+
+4. Enhanced Aspect with Parameter Group Handling (Optional)
+If you need to ensure parameter group compatibility or create new ones:
+
+
+// lib/aspects/postgres-upgrade-aspect-enhanced.ts
+import { IAspect, Annotations, Stack } from 'aws-cdk-lib';
+import { IConstruct } from 'constructs';
+import * as rds from 'aws-cdk-lib/aws-rds';
+
+export interface PostgresUpgradeAspectEnhancedProps {
+  readonly targetVersion?: string;
+  readonly enabled?: boolean;
+  readonly parameterGroupStrategy?: 'keep-existing' | 'create-new';
+  readonly customParameters?: Record<string, string>;
+}
+
+export class PostgresUpgradeAspectEnhanced implements IAspect {
+  private readonly targetVersion: string;
+  private readonly enabled: boolean;
+  private readonly parameterGroupStrategy: string;
+  private readonly customParameters: Record<string, string>;
+  private readonly processedGroups: Set<string> = new Set();
+
+  constructor(props: PostgresUpgradeAspectEnhancedProps = {}) {
+    this.targetVersion = props.targetVersion ?? '17';
+    this.enabled = props.enabled ?? true;
+    this.parameterGroupStrategy = props.parameterGroupStrategy ?? 'keep-existing';
+    this.customParameters = props.customParameters ?? {};
+  }
+
+  public visit(node: IConstruct): void {
+    if (!this.enabled) return;
+
+    if (node instanceof rds.CfnDBInstance) {
+      this.upgradeDbInstance(node);
+    }
+
+    if (node instanceof rds.CfnDBCluster) {
+      this.upgradeDbCluster(node);
+    }
+  }
+
+  private upgradeDbInstance(instance: rds.CfnDBInstance): void {
+    const engine = instance.engine?.toLowerCase();
+    if (!engine?.includes('postgres')) return;
+
+    const currentVersion = instance.engineVersion ?? 'unknown';
+    instance.engineVersion = this.targetVersion;
+    instance.allowMajorVersionUpgrade = true;
+
+    if (this.parameterGroupStrategy === 'create-new') {
+      const stack = Stack.of(instance);
+      const groupId = `pg17-${instance.node.id}`;
+      
+      if (!this.processedGroups.has(groupId)) {
+        const paramGroup = new rds.CfnDBParameterGroup(stack, groupId, {
+          family: `postgres${this.targetVersion}`,
+          description: `Parameter group for PostgreSQL ${this.targetVersion}`,
+          parameters: this.customParameters,
+        });
+        instance.dbParameterGroupName = paramGroup.ref;
+        this.processedGroups.add(groupId);
+      }
+    }
+    // 'keep-existing' - parameter group property unchanged
+
+    Annotations.of(instance).addWarning(
+      `PostgreSQL upgrade: ${currentVersion} → ${this.targetVersion}`
+    );
+  }
+
+  private upgradeDbCluster(cluster: rds.CfnDBCluster): void {
+    const engine = cluster.engine?.toLowerCase();
+    if (!engine?.includes('aurora-postgresql')) return;
+
+    const currentVersion = cluster.engineVersion ?? 'unknown';
+    cluster.engineVersion = this.targetVersion;
+    cluster.allowMajorVersionUpgrade = true;
+
+    if (this.parameterGroupStrategy === 'create-new') {
+      const stack = Stack.of(cluster);
+      const groupId = `aurora-pg17-${cluster.node.id}`;
+      
+      if (!this.processedGroups.has(groupId)) {
+        const clusterParamGroup = new rds.CfnDBClusterParameterGroup(stack, groupId, {
+          family: `aurora-postgresql${this.targetVersion}`,
+          description: `Aurora PostgreSQL ${this.targetVersion} cluster parameter group`,
+          parameters: this.customParameters,
+        });
+        cluster.dbClusterParameterGroupName = clusterParamGroup.ref;
+        this.processedGroups.add(groupId);
+      }
+    }
+
+    Annotations.of(cluster).addWarning(
+      `Aurora PostgreSQL upgrade: ${currentVersion} → ${this.targetVersion}`
+    );
+  }
+}
+
+Deployment Strategy
+Phased Rollout
+
+// cdk.json - use context for environment control
+{
+  "context": {
+    "environments": {
+      "dev": {
+        "upgradeEnabled": true,
+        "targetVersion": "17"
+      },
+      "test": {
+        "upgradeEnabled": true,
+        "targetVersion": "17"
+      },
+      "prod": {
+        "upgradeEnabled": false,
+        "targetVersion": "17"
+      }
+    }
+  }
+}
+
+Deployment Commands
+
+# 1. Preview changes (all environments)
+cdk diff -c environment=dev
+cdk diff -c environment=test
+cdk diff -c environment=prod
+
+# 2. Deploy to dev first
+cdk deploy -c environment=dev
+
+# 3. After validation, deploy to test
+cdk deploy -c environment=test
+
+# 4. Finally, enable and deploy to prod
+# Update cdk.json: prod.upgradeEnabled = true
+cdk deploy -c environment=prod
+
+Summary
+ComponentChanges RequiredFactory/Config codeNoneExisting RDS constructsNoneNew filespostgres-upgrade-aspect.tsStack modificationAdd 1 method call
+
+The Aspect automatically finds all PostgreSQL and Aurora PostgreSQL resources and applies the upgrade settings while preserving your existing parameter groups.
+
+--------
+
+allow specifying the db instance that needs to be upgraded.
+it could be in config file.
+
+
+The user wants to enhance the solution to allow specifying which specific DB instances should be upgraded. This should be configurable via a config file, which aligns with their existing factory method and config-based approach.
+I'll need to:
+
+Create a config structure that lists which DB instances to upgrade
+Modify the Aspect to check if a DB instance is in the upgrade list
+Support matching by DB identifier, construct ID, or other identifiers
+Keep it flexible for different environments
+
+
+Enhanced RDS Upgrade Solution with Instance Selection
+This enhancement allows you to specify which DB instances to upgrade via config files, integrating with your existing factory/config pattern.
+Implementation
+1. Upgrade Configuration File
+
+// config/upgrade-config.ts
+export interface DbUpgradeTarget {
+  /**
+   * DB instance or cluster identifier (supports wildcards with *)
+   */
+  readonly identifier: string;
+
+  /**
+   * Target PostgreSQL version
+   */
+  readonly targetVersion: string;
+
+  /**
+   * Optional: Override parameter group
+   */
+  readonly parameterGroupName?: string;
+}
+
+export interface UpgradeConfig {
+  /**
+   * Enable/disable upgrades for this environment
+   */
+  readonly enabled: boolean;
+
+  /**
+   * List of DB instances/clusters to upgrade
+   * Empty array = no upgrades, '*' in identifier = wildcard match
+   */
+  readonly targets: DbUpgradeTarget[];
+
+  /**
+   * Default version if not specified per target
+   */
+  readonly defaultTargetVersion: string;
+}
+
+export const upgradeConfigs: Record<string, UpgradeConfig> = {
+  dev: {
+    enabled: true,
+    defaultTargetVersion: '17',
+    targets: [
+      { identifier: 'myapp-dev-primary-db', targetVersion: '17' },
+      { identifier: 'myapp-dev-analytics-db', targetVersion: '17' },
+      { identifier: 'myapp-dev-aurora-*', targetVersion: '17' },  // Wildcard for all dev Aurora clusters
+    ],
+  },
+  test: {
+    enabled: true,
+    defaultTargetVersion: '17',
+    targets: [
+      { identifier: 'myapp-test-primary-db', targetVersion: '17' },
+      { identifier: 'myapp-test-analytics-db', targetVersion: '17' },
+    ],
+  },
+  prod: {
+    enabled: false,  // Disabled until dev/test validated
+    defaultTargetVersion: '17',
+    targets: [
+      { identifier: 'myapp-prod-primary-db', targetVersion: '17' },
+      { identifier: 'myapp-prod-replica-db', targetVersion: '17' },
+      { identifier: 'myapp-prod-aurora-cluster', targetVersion: '17' },
+    ],
+  },
+};
+
+2. Alternative: JSON Config File
+
+// config/upgrade-config.json
+{
+  "dev": {
+    "enabled": true,
+    "defaultTargetVersion": "17",
+    "targets": [
+      { "identifier": "myapp-dev-primary-db", "targetVersion": "17" },
+      { "identifier": "myapp-dev-analytics-db", "targetVersion": "17" },
+      { "identifier": "myapp-dev-aurora-*", "targetVersion": "17" }
+    ]
+  },
+  "test": {
+    "enabled": true,
+    "defaultTargetVersion": "17",
+    "targets": [
+      { "identifier": "myapp-test-primary-db", "targetVersion": "17" },
+      { "identifier": "myapp-test-analytics-db", "targetVersion": "17" }
+    ]
+  },
+  "prod": {
+    "enabled": false,
+    "defaultTargetVersion": "17",
+    "targets": [
+      { "identifier": "myapp-prod-primary-db", "targetVersion": "17" },
+      { "identifier": "myapp-prod-replica-db", "targetVersion": "17" },
+      { "identifier": "myapp-prod-aurora-cluster", "targetVersion": "17" }
+    ]
+  }
+}
+
+3. Enhanced Aspect with Target Selection
+
+// lib/aspects/postgres-upgrade-aspect.ts
+import { IAspect, Annotations } from 'aws-cdk-lib';
+import { IConstruct } from 'constructs';
+import * as rds from 'aws-cdk-lib/aws-rds';
+
+export interface DbUpgradeTarget {
+  readonly identifier: string;
+  readonly targetVersion: string;
+  readonly parameterGroupName?: string;
+}
+
+export interface PostgresUpgradeAspectProps {
+  /**
+   * Enable the upgrade
+   * @default true
+   */
+  readonly enabled?: boolean;
+
+  /**
+   * List of specific DB instances/clusters to upgrade
+   * Supports wildcard matching with *
+   */
+  readonly targets: DbUpgradeTarget[];
+
+  /**
+   * Default version if target doesn't specify one
+   * @default '17'
+   */
+  readonly defaultTargetVersion?: string;
+
+  /**
+   * Add annotation warnings for visibility
+   * @default true
+   */
+  readonly addAnnotations?: boolean;
+
+  /**
+   * Match strategy: 'identifier' matches dbInstanceIdentifier/dbClusterIdentifier,
+   * 'construct-id' matches the CDK construct ID, 'both' tries both
+   * @default 'both'
+   */
+  readonly matchStrategy?: 'identifier' | 'construct-id' | 'both';
+}
+
+export class PostgresUpgradeAspect implements IAspect {
+  private readonly enabled: boolean;
+  private readonly targets: DbUpgradeTarget[];
+  private readonly defaultTargetVersion: string;
+  private readonly addAnnotations: boolean;
+  private readonly matchStrategy: string;
+  private readonly upgradedResources: string[] = [];
+
+  constructor(props: PostgresUpgradeAspectProps) {
+    this.enabled = props.enabled ?? true;
+    this.targets = props.targets;
+    this.defaultTargetVersion = props.defaultTargetVersion ?? '17';
+    this.addAnnotations = props.addAnnotations ?? true;
+    this.matchStrategy = props.matchStrategy ?? 'both';
+  }
+
+  public visit(node: IConstruct): void {
+    if (!this.enabled || this.targets.length === 0) {
+      return;
+    }
+
+    if (node instanceof rds.CfnDBInstance) {
+      this.processDbInstance(node);
+    }
+
+    if (node instanceof rds.CfnDBCluster) {
+      this.processDbCluster(node);
+    }
+  }
+
+  /**
+   * Get list of resources that were upgraded (useful for reporting)
+   */
+  public getUpgradedResources(): string[] {
+    return [...this.upgradedResources];
+  }
+
+  private processDbInstance(instance: rds.CfnDBInstance): void {
+    const engine = instance.engine?.toLowerCase();
+    if (!engine?.includes('postgres')) {
+      return;
+    }
+
+    const instanceIdentifier = instance.dbInstanceIdentifier;
+    const constructId = instance.node.id;
+
+    const matchedTarget = this.findMatchingTarget(instanceIdentifier, constructId);
+    if (!matchedTarget) {
+      return;
+    }
+
+    const currentVersion = instance.engineVersion ?? 'unknown';
+    const targetVersion = matchedTarget.targetVersion || this.defaultTargetVersion;
+
+    // Apply upgrade settings
+    instance.engineVersion = targetVersion;
+    instance.allowMajorVersionUpgrade = true;
+
+    // Apply custom parameter group if specified
+    if (matchedTarget.parameterGroupName) {
+      instance.dbParameterGroupName = matchedTarget.parameterGroupName;
+    }
+
+    this.upgradedResources.push(instanceIdentifier ?? constructId);
+
+    if (this.addAnnotations) {
+      Annotations.of(instance).addWarning(
+        `PostgreSQL upgrade scheduled: ${currentVersion} → ${targetVersion} ` +
+        `for instance "${instanceIdentifier ?? constructId}" ` +
+        `(matched pattern: "${matchedTarget.identifier}")`
+      );
+    }
+  }
+
+  private processDbCluster(cluster: rds.CfnDBCluster): void {
+    const engine = cluster.engine?.toLowerCase();
+    if (!engine?.includes('aurora-postgresql')) {
+      return;
+    }
+
+    const clusterIdentifier = cluster.dbClusterIdentifier;
+    const constructId = cluster.node.id;
+
+    const matchedTarget = this.findMatchingTarget(clusterIdentifier, constructId);
+    if (!matchedTarget) {
+      return;
+    }
+
+    const currentVersion = cluster.engineVersion ?? 'unknown';
+    const targetVersion = matchedTarget.targetVersion || this.defaultTargetVersion;
+
+    // Apply upgrade settings
+    cluster.engineVersion = targetVersion;
+    cluster.allowMajorVersionUpgrade = true;
+
+    // Apply custom parameter group if specified
+    if (matchedTarget.parameterGroupName) {
+      cluster.dbClusterParameterGroupName = matchedTarget.parameterGroupName;
+    }
+
+    this.upgradedResources.push(clusterIdentifier ?? constructId);
+
+    if (this.addAnnotations) {
+      Annotations.of(cluster).addWarning(
+        `Aurora PostgreSQL upgrade scheduled: ${currentVersion} → ${targetVersion} ` +
+        `for cluster "${clusterIdentifier ?? constructId}" ` +
+        `(matched pattern: "${matchedTarget.identifier}")`
+      );
+    }
+  }
+
+  private findMatchingTarget(
+    identifier: string | undefined,
+    constructId: string
+  ): DbUpgradeTarget | undefined {
+    for (const target of this.targets) {
+      const pattern = target.identifier;
+
+      if (this.matchStrategy === 'identifier' || this.matchStrategy === 'both') {
+        if (identifier && this.matchesPattern(identifier, pattern)) {
+          return target;
+        }
+      }
+
+      if (this.matchStrategy === 'construct-id' || this.matchStrategy === 'both') {
+        if (this.matchesPattern(constructId, pattern)) {
+          return target;
+        }
+      }
+    }
+    return undefined;
+  }
+
+  private matchesPattern(value: string, pattern: string): boolean {
+    // Exact match
+    if (pattern === value) {
+      return true;
+    }
+
+    // Wildcard match (convert * to regex)
+    if (pattern.includes('*')) {
+      const regexPattern = pattern
+        .replace(/[.+?^${}()|[\]\\]/g, '\\$&')  // Escape special regex chars
+        .replace(/\*/g, '.*');                    // Convert * to .*
+      const regex = new RegExp(`^${regexPattern}$`, 'i');
+      return regex.test(value);
+    }
+
+    return false;
+  }
+}
+
+4. Apply in Your Stack
+
+// lib/your-existing-stack.ts
+import { Stack, StackProps, Aspects } from 'aws-cdk-lib';
+import { Construct } from 'constructs';
+import { PostgresUpgradeAspect } from './aspects/postgres-upgrade-aspect';
+import { upgradeConfigs } from '../config/upgrade-config';
+
+export interface YourStackProps extends StackProps {
+  readonly environment: 'dev' | 'test' | 'prod';
+}
+
+export class YourExistingStack extends Stack {
+  constructor(scope: Construct, id: string, props: YourStackProps) {
+    super(scope, id, props);
+
+    // =============================================
+    // YOUR EXISTING CODE - NO CHANGES NEEDED
+    // =============================================
+
+    // ... existing RDS/Aurora deployment code ...
+
+    // =============================================
+    // APPLY UPGRADE ASPECT
+    // =============================================
+    this.applyPostgresUpgrade(props.environment);
+  }
+
+  private applyPostgresUpgrade(environment: string): void {
+    const config = upgradeConfigs[environment];
+    
+    if (!config) {
+      console.warn(`No upgrade config found for environment: ${environment}`);
+      return;
+    }
+
+    Aspects.of(this).add(new PostgresUpgradeAspect({
+      enabled: config.enabled,
+      targets: config.targets,
+      defaultTargetVersion: config.defaultTargetVersion,
+    }));
+  }
+}
+
+5. Alternative: Load from JSON Config
+
+// lib/your-existing-stack.ts
+import * as fs from 'fs';
+import * as path from 'path';
+
+export class YourExistingStack extends Stack {
+  // ... constructor and other code ...
+
+  private applyPostgresUpgrade(environment: string): void {
+    const configPath = path.join(__dirname, '../config/upgrade-config.json');
+    const allConfigs = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    const config = allConfigs[environment];
+
+    if (!config?.enabled) {
+      return;
+    }
+
+    Aspects.of(this).add(new PostgresUpgradeAspect({
+      enabled: config.enabled,
+      targets: config.targets,
+      defaultTargetVersion: config.defaultTargetVersion,
+    }));
+  }
+}
+
+6. Using cdk.json Context (Alternative)
+
+// cdk.json
+{
+  "context": {
+    "upgrade": {
+      "dev": {
+        "enabled": true,
+        "defaultTargetVersion": "17",
+        "targets": [
+          { "identifier": "myapp-dev-primary-db", "targetVersion": "17" },
+          { "identifier": "myapp-dev-aurora-*", "targetVersion": "17" }
+        ]
+      },
+      "test": {
+        "enabled": true,
+        "defaultTargetVersion": "17",
+        "targets": [
+          { "identifier": "myapp-test-*", "targetVersion": "17" }
+        ]
+      },
+      "prod": {
+        "enabled": false,
+        "defaultTargetVersion": "17",
+        "targets": []
+      }
+    }
+  }
+}
+
+// In your stack
+private applyPostgresUpgrade(environment: string): void {
+  const allConfigs = this.node.tryGetContext('upgrade') ?? {};
+  const config = allConfigs[environment];
+
+  if (!config?.enabled) {
+    return;
+  }
+
+  Aspects.of(this).add(new PostgresUpgradeAspect({
+    enabled: config.enabled,
+    targets: config.targets,
+    defaultTargetVersion: config.defaultTargetVersion,
+  }));
+}
+
+Config Examples
+Selective Upgrade by Instance
+
+// Only upgrade specific instances
+targets: [
+  { identifier: 'myapp-dev-primary-db', targetVersion: '17' },
+  { identifier: 'myapp-dev-reporting-db', targetVersion: '17' },
+]
+
+Wildcard Patterns
+
+// Upgrade all instances matching pattern
+targets: [
+  { identifier: 'myapp-dev-*', targetVersion: '17' },           // All dev instances
+  { identifier: '*-analytics-*', targetVersion: '17' },          // All analytics DBs
+  { identifier: 'myapp-*-aurora-cluster', targetVersion: '17' }, // All Aurora clusters
+]
+
+Custom Parameter Groups
+
+targets: [
+  { 
+    identifier: 'myapp-prod-primary-db', 
+    targetVersion: '17',
+    parameterGroupName: 'myapp-postgres17-optimized'
+  },
+]
+
+Deployment
+
+# Preview what will be upgraded
+cdk diff -c environment=dev
+
+# Deploy dev (only configured instances upgraded)
+cdk deploy -c environment=dev
+
+# After validation, update test config and deploy
+cdk deploy -c environment=test
+
+# Finally enable prod in config and deploy
+cdk deploy -c environment=prod
+
+Summary
+FeatureSupportSpecific instance selection✅Wildcard patterns✅Per-instance version✅Custom parameter groups✅Environment-specific configs✅Config file formatsTS, JSON, cdk.json
+
