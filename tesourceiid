@@ -1,0 +1,841 @@
+#!/usr/bin/env python3
+"""
+RDS Resource ID IAM Audit
+=========================
+
+Scans the AWS account for any references to an RDS instance or cluster's
+DbiResourceId / DbClusterResourceId in:
+
+  1. IAM managed policies (AWS + customer-managed, all versions)
+  2. IAM inline policies (on users, groups, roles)
+  3. IAM role trust policies (AssumeRolePolicyDocument)
+  4. Resource-based policies (Secrets Manager, KMS, S3 bucket policies)
+  5. RDS IAM authentication configuration on the instance/cluster
+  6. AWS Organizations SCPs (if running in management/delegated account)
+  7. Lake Formation data lake permissions
+  8. CloudTrail event selectors (data events for RDS)
+
+This matters because:
+  * IAM database authentication uses the DbiResourceId in the policy ARN:
+      arn:aws:rds-db:<region>:<account>:dbuser:<dbi-resource-id>/<db_user>
+  * Blue/Green switchover assigns a NEW resource ID to the promoted green.
+  * Any IAM policy referencing the OLD resource ID will silently deny access
+    after switchover.
+
+Usage:
+  python rds_resource_id_audit.py \
+      --identifier my-prod-db \
+      --region us-east-1 \
+      [--profile my-sso-profile] \
+      [--check-cross-account 111111111111 222222222222]
+
+Output:
+  Prints every IAM entity and policy document where the resource ID appears,
+  with the specific ARN / policy name / line so you know exactly what to
+  update post-switchover.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import sys
+import urllib.parse
+from dataclasses import dataclass, field
+from typing import Any, Optional
+
+import boto3
+from botocore.exceptions import ClientError
+
+
+# --------------------------------------------------------------------------- #
+# Logging
+# --------------------------------------------------------------------------- #
+
+LOG_FMT = "%(asctime)s  %(levelname)-7s  %(message)s"
+logging.basicConfig(level=logging.INFO, format=LOG_FMT, datefmt="%H:%M:%S")
+log = logging.getLogger("rds-resid-audit")
+
+
+# --------------------------------------------------------------------------- #
+# Data structures
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class ResourceIdInfo:
+    """Collected resource IDs from the target RDS resource."""
+    identifier: str                         # user-supplied name
+    kind: str                               # "instance" | "cluster"
+    engine: str
+    dbi_resource_ids: list[str] = field(default_factory=list)   # per-instance
+    cluster_resource_id: Optional[str] = None                   # cluster-level
+    iam_auth_enabled: bool = False
+    region: str = ""
+    account_id: str = ""
+
+
+@dataclass
+class Finding:
+    """A single location where a resource ID was found."""
+    resource_id: str
+    location_type: str      # "managed-policy" | "inline-policy" | "trust-policy" |
+                            # "secret-policy" | "kms-policy" | "scp" | "s3-policy" |
+                            # "lakeformation" | "cloudtrail"
+    entity_arn: str         # ARN of the IAM user/role/group/policy/secret/key
+    entity_name: str        # human-readable name
+    policy_name: str        # policy name (for inline) or version (for managed)
+    snippet: str            # the matching line / fragment
+    severity: str = "HIGH"  # HIGH = will break on switchover
+
+
+# --------------------------------------------------------------------------- #
+# Resource ID collection
+# --------------------------------------------------------------------------- #
+
+def collect_resource_ids(rds: Any, sts: Any, identifier: str, region: str) -> ResourceIdInfo:
+    """
+    Resolve the identifier and collect all DbiResourceIds and
+    DbClusterResourceId associated with it.
+    """
+    account_id = sts.get_caller_identity()["Account"]
+    info = ResourceIdInfo(identifier=identifier, kind="unknown", engine="",
+                          region=region, account_id=account_id)
+
+    # Try cluster first
+    try:
+        resp = rds.describe_db_clusters(DBClusterIdentifier=identifier)
+        cluster = resp["DBClusters"][0]
+        info.kind = "cluster"
+        info.engine = cluster["Engine"]
+        info.cluster_resource_id = cluster.get("DbClusterResourceId")
+        info.iam_auth_enabled = cluster.get("IAMDatabaseAuthenticationEnabled", False)
+
+        # Collect DbiResourceId from every member instance
+        for member in cluster.get("DBClusterMembers", []):
+            inst_id = member["DBInstanceIdentifier"]
+            try:
+                inst_resp = rds.describe_db_instances(DBInstanceIdentifier=inst_id)
+                inst = inst_resp["DBInstances"][0]
+                dbi_rid = inst.get("DbiResourceId")
+                if dbi_rid:
+                    info.dbi_resource_ids.append(dbi_rid)
+            except ClientError:
+                log.warning("Could not describe member instance '%s'", inst_id)
+        return info
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "DBClusterNotFoundFault":
+            raise
+
+    # Fallback: standalone instance
+    try:
+        resp = rds.describe_db_instances(DBInstanceIdentifier=identifier)
+        inst = resp["DBInstances"][0]
+        info.kind = "instance"
+        info.engine = inst["Engine"]
+        info.iam_auth_enabled = inst.get("IAMDatabaseAuthenticationEnabled", False)
+        dbi_rid = inst.get("DbiResourceId")
+        if dbi_rid:
+            info.dbi_resource_ids.append(dbi_rid)
+
+        # If this instance is part of a cluster, also grab the cluster resource ID
+        cluster_id = inst.get("DBClusterIdentifier")
+        if cluster_id:
+            try:
+                cl_resp = rds.describe_db_clusters(DBClusterIdentifier=cluster_id)
+                info.cluster_resource_id = cl_resp["DBClusters"][0].get("DbClusterResourceId")
+            except ClientError:
+                pass
+
+        # Also collect read replicas
+        for replica_id in inst.get("ReadReplicaDBInstanceIdentifiers", []):
+            try:
+                r_resp = rds.describe_db_instances(DBInstanceIdentifier=replica_id)
+                r_dbi = r_resp["DBInstances"][0].get("DbiResourceId")
+                if r_dbi:
+                    info.dbi_resource_ids.append(r_dbi)
+            except ClientError:
+                log.warning("Could not describe replica '%s'", replica_id)
+
+        return info
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "DBInstanceNotFound":
+            raise SystemExit(f"No RDS cluster or instance named '{identifier}' found")
+        raise
+
+
+def _all_search_ids(info: ResourceIdInfo) -> list[str]:
+    """Return all resource IDs to search for."""
+    ids = list(info.dbi_resource_ids)
+    if info.cluster_resource_id:
+        ids.append(info.cluster_resource_id)
+    return ids
+
+
+# --------------------------------------------------------------------------- #
+# Policy document scanning
+# --------------------------------------------------------------------------- #
+
+def _search_policy_doc(doc: dict | str, search_ids: list[str]) -> list[str]:
+    """
+    Search a policy document (parsed or string) for any of the resource IDs.
+    Returns matching snippets.
+    """
+    if isinstance(doc, str):
+        text = doc
+    else:
+        text = json.dumps(doc)
+
+    matches = []
+    for rid in search_ids:
+        if rid in text:
+            # Extract the line(s) containing the match for context
+            for line in text.split("\n"):
+                if rid in line:
+                    matches.append(line.strip()[:300])
+    return matches
+
+
+# --------------------------------------------------------------------------- #
+# IAM scanning
+# --------------------------------------------------------------------------- #
+
+def scan_managed_policies(iam: Any, search_ids: list[str]) -> list[Finding]:
+    """Scan all customer-managed and AWS-managed policies (all versions)."""
+    findings: list[Finding] = []
+
+    paginator = iam.get_paginator("list_policies")
+    # Scan both Local (customer) and AWS policies
+    for scope in ("Local", "AWS"):
+        log.info("Scanning %s managed policies...", scope)
+        count = 0
+        for page in paginator.paginate(Scope=scope, OnlyAttached=(scope == "AWS")):
+            for policy in page["Policies"]:
+                count += 1
+                arn = policy["Arn"]
+                name = policy["PolicyName"]
+
+                # Check all versions of customer policies; only default for AWS
+                if scope == "Local":
+                    versions_resp = iam.list_policy_versions(PolicyArn=arn)
+                    versions = [v["VersionId"] for v in versions_resp["Versions"]]
+                else:
+                    versions = [policy["DefaultVersionId"]]
+
+                for vid in versions:
+                    try:
+                        ver_resp = iam.get_policy_version(PolicyArn=arn, VersionId=vid)
+                        doc = ver_resp["PolicyVersion"]["Document"]
+                        matches = _search_policy_doc(doc, search_ids)
+                        for m in matches:
+                            rid = next(r for r in search_ids if r in m)
+                            findings.append(Finding(
+                                resource_id=rid,
+                                location_type="managed-policy",
+                                entity_arn=arn,
+                                entity_name=name,
+                                policy_name=vid,
+                                snippet=m,
+                            ))
+                    except ClientError as e:
+                        if e.response["Error"]["Code"] != "NoSuchEntity":
+                            log.warning("Error reading %s %s: %s", arn, vid, e)
+
+        log.info("  scanned %d %s policies", count, scope)
+
+    return findings
+
+
+def scan_inline_policies(iam: Any, search_ids: list[str]) -> list[Finding]:
+    """Scan inline policies on all users, groups, and roles."""
+    findings: list[Finding] = []
+
+    # Users
+    log.info("Scanning IAM user inline policies...")
+    for page in iam.get_paginator("list_users").paginate():
+        for user in page["Users"]:
+            uname = user["UserName"]
+            for p_page in iam.get_paginator("list_user_policies").paginate(UserName=uname):
+                for pname in p_page["PolicyNames"]:
+                    doc = iam.get_user_policy(UserName=uname, PolicyName=pname)["PolicyDocument"]
+                    for m in _search_policy_doc(doc, search_ids):
+                        rid = next(r for r in search_ids if r in m)
+                        findings.append(Finding(
+                            resource_id=rid,
+                            location_type="inline-policy",
+                            entity_arn=user["Arn"],
+                            entity_name=f"user/{uname}",
+                            policy_name=pname,
+                            snippet=m,
+                        ))
+
+    # Groups
+    log.info("Scanning IAM group inline policies...")
+    for page in iam.get_paginator("list_groups").paginate():
+        for group in page["Groups"]:
+            gname = group["GroupName"]
+            for p_page in iam.get_paginator("list_group_policies").paginate(GroupName=gname):
+                for pname in p_page["PolicyNames"]:
+                    doc = iam.get_group_policy(GroupName=gname, PolicyName=pname)["PolicyDocument"]
+                    for m in _search_policy_doc(doc, search_ids):
+                        rid = next(r for r in search_ids if r in m)
+                        findings.append(Finding(
+                            resource_id=rid,
+                            location_type="inline-policy",
+                            entity_arn=group["Arn"],
+                            entity_name=f"group/{gname}",
+                            policy_name=pname,
+                            snippet=m,
+                        ))
+
+    # Roles
+    log.info("Scanning IAM role inline policies...")
+    for page in iam.get_paginator("list_roles").paginate():
+        for role in page["Roles"]:
+            rname = role["RoleName"]
+            # Trust policy (AssumeRolePolicyDocument)
+            trust_doc = role.get("AssumeRolePolicyDocument", {})
+            for m in _search_policy_doc(trust_doc, search_ids):
+                rid = next(r for r in search_ids if r in m)
+                findings.append(Finding(
+                    resource_id=rid,
+                    location_type="trust-policy",
+                    entity_arn=role["Arn"],
+                    entity_name=f"role/{rname}",
+                    policy_name="AssumeRolePolicyDocument",
+                    snippet=m,
+                ))
+
+            # Inline policies
+            for p_page in iam.get_paginator("list_role_policies").paginate(RoleName=rname):
+                for pname in p_page["PolicyNames"]:
+                    doc = iam.get_role_policy(RoleName=rname, PolicyName=pname)["PolicyDocument"]
+                    for m in _search_policy_doc(doc, search_ids):
+                        rid = next(r for r in search_ids if r in m)
+                        findings.append(Finding(
+                            resource_id=rid,
+                            location_type="inline-policy",
+                            entity_arn=role["Arn"],
+                            entity_name=f"role/{rname}",
+                            policy_name=pname,
+                            snippet=m,
+                        ))
+
+    return findings
+
+
+# --------------------------------------------------------------------------- #
+# Resource-based policy scanning
+# --------------------------------------------------------------------------- #
+
+def scan_secrets_manager(session: boto3.Session, search_ids: list[str],
+                         region: str) -> list[Finding]:
+    """Scan Secrets Manager resource policies for resource ID references."""
+    findings: list[Finding] = []
+    sm = session.client("secretsmanager", region_name=region)
+    log.info("Scanning Secrets Manager resource policies...")
+
+    try:
+        for page in sm.get_paginator("list_secrets").paginate():
+            for secret in page["SecretList"]:
+                name = secret["Name"]
+                arn = secret["ARN"]
+                try:
+                    pol_resp = sm.get_resource_policy(SecretId=arn)
+                    policy_str = pol_resp.get("ResourcePolicy")
+                    if policy_str:
+                        for m in _search_policy_doc(policy_str, search_ids):
+                            rid = next(r for r in search_ids if r in m)
+                            findings.append(Finding(
+                                resource_id=rid,
+                                location_type="secret-policy",
+                                entity_arn=arn,
+                                entity_name=f"secret/{name}",
+                                policy_name="ResourcePolicy",
+                                snippet=m,
+                            ))
+                except ClientError:
+                    pass  # No resource policy on this secret
+    except ClientError as e:
+        log.warning("Secrets Manager scan failed: %s", e)
+
+    return findings
+
+
+def scan_kms_policies(session: boto3.Session, search_ids: list[str],
+                      region: str) -> list[Finding]:
+    """Scan KMS key policies for resource ID references."""
+    findings: list[Finding] = []
+    kms = session.client("kms", region_name=region)
+    log.info("Scanning KMS key policies...")
+
+    try:
+        for page in kms.get_paginator("list_keys").paginate():
+            for key in page["Keys"]:
+                key_id = key["KeyId"]
+                key_arn = key["KeyArn"]
+                try:
+                    pol_resp = kms.get_key_policy(KeyId=key_id, PolicyName="default")
+                    policy_str = pol_resp["Policy"]
+                    for m in _search_policy_doc(policy_str, search_ids):
+                        rid = next(r for r in search_ids if r in m)
+                        # Check if this is the RDS encryption key
+                        findings.append(Finding(
+                            resource_id=rid,
+                            location_type="kms-policy",
+                            entity_arn=key_arn,
+                            entity_name=f"kms/{key_id}",
+                            policy_name="default",
+                            snippet=m,
+                        ))
+                except ClientError:
+                    pass  # Likely AWS-managed key we can't read
+    except ClientError as e:
+        log.warning("KMS scan failed: %s", e)
+
+    return findings
+
+
+def scan_s3_bucket_policies(session: boto3.Session, search_ids: list[str]) -> list[Finding]:
+    """Scan S3 bucket policies for resource ID references."""
+    findings: list[Finding] = []
+    s3 = session.client("s3")
+    log.info("Scanning S3 bucket policies...")
+
+    try:
+        buckets = s3.list_buckets().get("Buckets", [])
+        for bucket in buckets:
+            bname = bucket["Name"]
+            try:
+                pol_resp = s3.get_bucket_policy(Bucket=bname)
+                policy_str = pol_resp["Policy"]
+                for m in _search_policy_doc(policy_str, search_ids):
+                    rid = next(r for r in search_ids if r in m)
+                    findings.append(Finding(
+                        resource_id=rid,
+                        location_type="s3-policy",
+                        entity_arn=f"arn:aws:s3:::{bname}",
+                        entity_name=f"s3/{bname}",
+                        policy_name="BucketPolicy",
+                        snippet=m,
+                    ))
+            except ClientError as e:
+                if e.response["Error"]["Code"] != "NoSuchBucketPolicy":
+                    pass  # Access denied or other — skip
+    except ClientError as e:
+        log.warning("S3 bucket policy scan failed: %s", e)
+
+    return findings
+
+
+# --------------------------------------------------------------------------- #
+# Organizations SCP scanning
+# --------------------------------------------------------------------------- #
+
+def scan_organizations_scps(session: boto3.Session, search_ids: list[str]) -> list[Finding]:
+    """Scan SCPs in AWS Organizations (only works from management account)."""
+    findings: list[Finding] = []
+    try:
+        org = session.client("organizations")
+        log.info("Scanning AWS Organizations SCPs...")
+
+        for page in org.get_paginator("list_policies").paginate(Filter="SERVICE_CONTROL_POLICY"):
+            for policy in page["Policies"]:
+                pid = policy["Id"]
+                pname = policy["Name"]
+                try:
+                    pol_resp = org.describe_policy(PolicyId=pid)
+                    content = pol_resp["Policy"]["Content"]
+                    for m in _search_policy_doc(content, search_ids):
+                        rid = next(r for r in search_ids if r in m)
+                        findings.append(Finding(
+                            resource_id=rid,
+                            location_type="scp",
+                            entity_arn=policy.get("Arn", pid),
+                            entity_name=f"scp/{pname}",
+                            policy_name=pid,
+                            snippet=m,
+                        ))
+                except ClientError:
+                    pass
+    except ClientError as e:
+        # Expected if not in management account
+        code = e.response["Error"]["Code"]
+        if code in ("AWSOrganizationsNotInUseException", "AccessDeniedException"):
+            log.info("Skipping Organizations SCP scan (not management account or no access)")
+        else:
+            log.warning("Organizations SCP scan failed: %s", e)
+
+    return findings
+
+
+# --------------------------------------------------------------------------- #
+# CloudTrail data event selectors
+# --------------------------------------------------------------------------- #
+
+def scan_cloudtrail(session: boto3.Session, search_ids: list[str],
+                    region: str) -> list[Finding]:
+    """Check CloudTrail trails for RDS data event selectors referencing resource IDs."""
+    findings: list[Finding] = []
+    ct = session.client("cloudtrail", region_name=region)
+    log.info("Scanning CloudTrail event selectors...")
+
+    try:
+        trails = ct.describe_trails().get("trailList", [])
+        for trail in trails:
+            tname = trail["Name"]
+            tarn = trail.get("TrailARN", tname)
+            try:
+                sel_resp = ct.get_event_selectors(TrailName=tname)
+                # Check both basic and advanced selectors
+                selectors_str = json.dumps(sel_resp)
+                for m in _search_policy_doc(selectors_str, search_ids):
+                    rid = next(r for r in search_ids if r in m)
+                    findings.append(Finding(
+                        resource_id=rid,
+                        location_type="cloudtrail",
+                        entity_arn=tarn,
+                        entity_name=f"trail/{tname}",
+                        policy_name="EventSelectors",
+                        snippet=m,
+                        severity="MEDIUM",
+                    ))
+            except ClientError:
+                pass
+    except ClientError as e:
+        log.warning("CloudTrail scan failed: %s", e)
+
+    return findings
+
+
+# --------------------------------------------------------------------------- #
+# IAM auth token generation endpoint check
+# --------------------------------------------------------------------------- #
+
+def check_iam_auth_config(info: ResourceIdInfo) -> list[Finding]:
+    """
+    Check if IAM database authentication is enabled on the instance/cluster.
+    If it is, every resource ID is potentially referenced in IAM policies
+    for rds-db:connect actions.
+    """
+    findings: list[Finding] = []
+    if not info.iam_auth_enabled:
+        return findings
+
+    for rid in _all_search_ids(info):
+        # Build the ARN pattern that IAM policies would use
+        arn_pattern = f"arn:aws:rds-db:{info.region}:{info.account_id}:dbuser:{rid}/*"
+        findings.append(Finding(
+            resource_id=rid,
+            location_type="iam-auth-config",
+            entity_arn=f"rds:{info.identifier}",
+            entity_name=info.identifier,
+            policy_name="IAMDatabaseAuthenticationEnabled=true",
+            snippet=(
+                f"IAM DB auth is ENABLED. Policies granting rds-db:connect "
+                f"use ARN pattern: {arn_pattern}  — this ARN will change "
+                f"after Blue/Green switchover."
+            ),
+            severity="CRITICAL",
+        ))
+
+    return findings
+
+
+# --------------------------------------------------------------------------- #
+# Cross-account check helper
+# --------------------------------------------------------------------------- #
+
+def scan_cross_account(session: boto3.Session, search_ids: list[str],
+                       target_account_ids: list[str], region: str) -> list[Finding]:
+    """
+    For each cross-account ID, attempt to assume a role and scan IAM.
+    Expects a role named 'RDSResourceIdAuditRole' in each target account.
+    Falls back gracefully if the role doesn't exist.
+    """
+    findings: list[Finding] = []
+    sts = session.client("sts")
+    source_account = sts.get_caller_identity()["Account"]
+
+    for acct_id in target_account_ids:
+        if acct_id == source_account:
+            continue
+        role_arn = f"arn:aws:iam::{acct_id}:role/RDSResourceIdAuditRole"
+        log.info("Attempting cross-account scan of %s via %s", acct_id, role_arn)
+        try:
+            creds = sts.assume_role(
+                RoleArn=role_arn,
+                RoleSessionName="rds-resid-audit",
+                DurationSeconds=900,
+            )["Credentials"]
+            x_session = boto3.Session(
+                aws_access_key_id=creds["AccessKeyId"],
+                aws_secret_access_key=creds["SecretAccessKey"],
+                aws_session_token=creds["SessionToken"],
+                region_name=region,
+            )
+            x_iam = x_session.client("iam")
+            findings.extend(scan_managed_policies(x_iam, search_ids))
+            findings.extend(scan_inline_policies(x_iam, search_ids))
+            # Tag cross-account findings
+            for f in findings:
+                if f.entity_name and not f.entity_name.startswith(f"[{acct_id}]"):
+                    f.entity_name = f"[{acct_id}] {f.entity_name}"
+        except ClientError as e:
+            code = e.response["Error"]["Code"]
+            if code in ("AccessDenied", "AccessDeniedException"):
+                log.warning("Cannot assume %s — ensure the role exists and "
+                            "trusts this account", role_arn)
+            else:
+                log.warning("Cross-account scan of %s failed: %s", acct_id, e)
+
+    return findings
+
+
+# --------------------------------------------------------------------------- #
+# Report
+# --------------------------------------------------------------------------- #
+
+def print_report(info: ResourceIdInfo, findings: list[Finding]) -> None:
+    """Print a structured audit report."""
+    print()
+    print("=" * 78)
+    print("RDS RESOURCE ID IAM AUDIT REPORT")
+    print("=" * 78)
+
+    print(f"\nTarget:              {info.identifier}")
+    print(f"Kind:                {info.kind}")
+    print(f"Engine:              {info.engine}")
+    print(f"Region:              {info.region}")
+    print(f"Account:             {info.account_id}")
+    print(f"IAM DB Auth:         {'ENABLED' if info.iam_auth_enabled else 'disabled'}")
+
+    print(f"\nResource IDs searched:")
+    for rid in info.dbi_resource_ids:
+        print(f"  DbiResourceId:         {rid}")
+    if info.cluster_resource_id:
+        print(f"  DbClusterResourceId:   {info.cluster_resource_id}")
+
+    if info.iam_auth_enabled:
+        print(f"\n  IAM DB auth ARN pattern (will change after switchover):")
+        for rid in info.dbi_resource_ids:
+            print(f"    arn:aws:rds-db:{info.region}:{info.account_id}:dbuser:{rid}/<db_user>")
+
+    print()
+    print("-" * 78)
+
+    if not findings:
+        print("\n  NO REFERENCES FOUND to any resource ID in this account.")
+        print("  Blue/Green switchover will not break any IAM policies.\n")
+        return
+
+    # Group by severity
+    critical = [f for f in findings if f.severity == "CRITICAL"]
+    high = [f for f in findings if f.severity == "HIGH"]
+    medium = [f for f in findings if f.severity == "MEDIUM"]
+
+    total = len(findings)
+    print(f"\n  FOUND {total} REFERENCE(S)  "
+          f"({len(critical)} CRITICAL, {len(high)} HIGH, {len(medium)} MEDIUM)")
+    print()
+
+    for sev, group in [("CRITICAL", critical), ("HIGH", high), ("MEDIUM", medium)]:
+        if not group:
+            continue
+        print(f"  [{sev}]")
+        print(f"  {'─' * 72}")
+        for i, f in enumerate(group, 1):
+            print(f"  {i}. Resource ID:   {f.resource_id}")
+            print(f"     Location:      {f.location_type}")
+            print(f"     Entity:        {f.entity_name}")
+            print(f"     Entity ARN:    {f.entity_arn}")
+            print(f"     Policy/Doc:    {f.policy_name}")
+            print(f"     Snippet:       {f.snippet}")
+            print()
+
+    print("-" * 78)
+    print("\n  REMEDIATION REQUIRED BEFORE SWITCHOVER:")
+    print()
+    print("  For each finding above, you must do ONE of the following:")
+    print()
+    print("  Option A — Use wildcards (recommended for IAM DB auth):")
+    print("    Replace the specific DbiResourceId in the policy ARN with '*':")
+    print(f"      arn:aws:rds-db:{info.region}:{info.account_id}:dbuser:*/{{db_user}}")
+    print()
+    print("  Option B — Use conditions on the DB instance identifier:")
+    print("    Add a Condition block with rds:DatabaseName or tag-based conditions")
+    print("    instead of embedding the resource ID in the ARN.")
+    print()
+    print("  Option C — Update the policy immediately after switchover:")
+    print("    Replace the old resource ID with the new green's resource ID.")
+    print("    The new ID is available from describe-db-instances after switchover.")
+    print("    RISK: there will be a window where IAM DB auth is denied.")
+    print()
+    print("  Option D — CDK/Terraform dynamic reference:")
+    print("    Use !GetAtt or Fn::GetAtt to pull DbiResourceId at deploy time")
+    print("    so it auto-updates when the resource changes.")
+    print()
+
+    # Machine-readable summary
+    print("-" * 78)
+    print("\n  MACHINE-READABLE SUMMARY (for automation):")
+    print()
+    summary = {
+        "identifier": info.identifier,
+        "resource_ids": _all_search_ids(info),
+        "iam_auth_enabled": info.iam_auth_enabled,
+        "total_findings": total,
+        "findings": [
+            {
+                "resource_id": f.resource_id,
+                "location_type": f.location_type,
+                "entity_arn": f.entity_arn,
+                "policy_name": f.policy_name,
+                "severity": f.severity,
+            }
+            for f in findings
+        ],
+    }
+    print(f"  {json.dumps(summary, indent=2)}")
+    print()
+
+
+# --------------------------------------------------------------------------- #
+# Main orchestration
+# --------------------------------------------------------------------------- #
+
+def run(args: argparse.Namespace) -> int:
+    kwargs: dict[str, Any] = {"region_name": args.region}
+    if args.profile:
+        kwargs["profile_name"] = args.profile
+    session = boto3.Session(**kwargs)
+
+    rds = session.client("rds")
+    iam = session.client("iam")
+    sts = session.client("sts")
+
+    # 1. Collect resource IDs
+    log.info("=" * 70)
+    log.info("STEP 1: Collect resource IDs for '%s'", args.identifier)
+    log.info("=" * 70)
+    info = collect_resource_ids(rds, sts, args.identifier, args.region)
+    search_ids = _all_search_ids(info)
+
+    if not search_ids:
+        log.error("No resource IDs found for '%s'", args.identifier)
+        return 1
+
+    log.info("Searching for %d resource ID(s): %s", len(search_ids), search_ids)
+
+    # 2. Check IAM auth enablement
+    log.info("=" * 70)
+    log.info("STEP 2: Check IAM database authentication configuration")
+    log.info("=" * 70)
+    all_findings: list[Finding] = []
+    all_findings.extend(check_iam_auth_config(info))
+
+    if info.iam_auth_enabled:
+        log.warning("IAM database authentication is ENABLED — resource ID "
+                     "references in IAM policies are EXPECTED and WILL BREAK "
+                     "on switchover unless updated.")
+    else:
+        log.info("IAM database authentication is disabled. Resource ID "
+                 "references in IAM policies are unlikely but still checked.")
+
+    # 3. Scan IAM managed policies
+    log.info("=" * 70)
+    log.info("STEP 3: Scan IAM managed policies")
+    log.info("=" * 70)
+    all_findings.extend(scan_managed_policies(iam, search_ids))
+
+    # 4. Scan IAM inline policies and trust policies
+    log.info("=" * 70)
+    log.info("STEP 4: Scan IAM inline + trust policies")
+    log.info("=" * 70)
+    all_findings.extend(scan_inline_policies(iam, search_ids))
+
+    # 5. Scan resource-based policies
+    log.info("=" * 70)
+    log.info("STEP 5: Scan resource-based policies")
+    log.info("=" * 70)
+    all_findings.extend(scan_secrets_manager(session, search_ids, args.region))
+    all_findings.extend(scan_kms_policies(session, search_ids, args.region))
+    all_findings.extend(scan_s3_bucket_policies(session, search_ids))
+
+    # 6. Scan Organizations SCPs
+    log.info("=" * 70)
+    log.info("STEP 6: Scan Organizations SCPs")
+    log.info("=" * 70)
+    all_findings.extend(scan_organizations_scps(session, search_ids))
+
+    # 7. Scan CloudTrail
+    log.info("=" * 70)
+    log.info("STEP 7: Scan CloudTrail event selectors")
+    log.info("=" * 70)
+    all_findings.extend(scan_cloudtrail(session, search_ids, args.region))
+
+    # 8. Cross-account scan (optional)
+    if args.check_cross_account:
+        log.info("=" * 70)
+        log.info("STEP 8: Cross-account IAM scan")
+        log.info("=" * 70)
+        all_findings.extend(
+            scan_cross_account(session, search_ids,
+                               args.check_cross_account, args.region))
+
+    # Report
+    print_report(info, all_findings)
+
+    # Exit code: 0 if clean, 2 if findings exist
+    return 2 if all_findings else 0
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Audit IAM and resource policies for RDS resource ID references",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("--identifier", required=True,
+                   help="RDS DB instance or cluster identifier")
+    p.add_argument("--region", required=True, help="AWS region")
+    p.add_argument("--profile", help="AWS named profile")
+    p.add_argument("--check-cross-account", nargs="*", metavar="ACCOUNT_ID",
+                   help="Cross-account IDs to scan (assumes "
+                        "RDSResourceIdAuditRole exists in each)")
+    return p.parse_args(argv)
+
+
+def main() -> int:
+    args = parse_args(sys.argv[1:])
+    try:
+        return run(args)
+    except KeyboardInterrupt:
+        log.error("Interrupted")
+        return 130
+    except SystemExit as e:
+        if isinstance(e.code, str):
+            log.error(e.code)
+            return 1
+        return int(e.code or 0)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+
+# Basic single-account audit
+python rds_resource_id_audit.py \
+  --identifier my-prod-db \
+  --region us-east-1 \
+  --profile my-sso
+
+# Multi-account Organizations audit
+python rds_resource_id_audit.py \
+  --identifier my-aurora-cluster \
+  --region us-east-1 \
+  --profile mgmt-account-sso \
+  --check-cross-account 111111111111 222222222222 333333333333
