@@ -1,0 +1,1432 @@
+sfn-launcher/
+  go.mod
+  main.go
+  static/
+    index.htm
+
+
+go get github.com/aws/aws-sdk-go-v2/config
+go get github.com/aws/aws-sdk-go-v2/service/sfn
+go mod tidy
+
+package main
+
+import (
+  "context"
+  "embed"
+  "encoding/json"
+  "fmt"
+  "log"
+  "net/http"
+  "os"
+  "strings"
+  "sync"
+  "time"
+
+  "github.com/aws/aws-sdk-go-v2/aws"
+  "github.com/aws/aws-sdk-go-v2/config"
+  "github.com/aws/aws-sdk-go-v2/service/sfn"
+)
+
+//go:embed static/index.html
+var staticFiles embed.FS
+
+type App struct {
+  sfnClient *sfn.Client
+  allowed  map[string]bool
+
+  mu   sync.Mutex
+  logs []ActivityLog
+}
+
+type StartRequest struct {
+  StateMachineArn string         `json:"stateMachineArn"`
+  ExecutionName   string         `json:"executionName,omitempty"`
+  Input           map[string]any `json:"input"`
+}
+
+type StartResponse struct {
+  ExecutionArn string `json:"executionArn"`
+  StartDate    string `json:"startDate"`
+}
+
+type ActivityLog struct {
+  Time    string         `json:"time"`
+  Level   string         `json:"level"`
+  Message string         `json:"message"`
+  Fields  map[string]any `json:"fields,omitempty"`
+}
+
+func main() {
+  ctx := context.Background()
+
+  cfg, err := config.LoadDefaultConfig(ctx)
+  if err != nil {
+    log.Fatalf("failed to load AWS config: %v", err)
+  }
+
+  app := &App{
+    sfnClient: sfn.NewFromConfig(cfg),
+    allowed:  loadAllowedStateMachines(),
+    logs:     make([]ActivityLog, 0, 100),
+  }
+
+  if len(app.allowed) == 0 {
+    app.addLog("WARN", "No ALLOWED_STATE_MACHINE_ARNS configured; any ARN submitted by the UI will be accepted", nil)
+  }
+
+  mux := http.NewServeMux()
+  mux.HandleFunc("/", app.handleIndex)
+  mux.HandleFunc("GET /api/health", app.handleHealth)
+  mux.HandleFunc("GET /api/logs", app.handleLogs)
+  mux.HandleFunc("POST /api/start", app.handleStartExecution)
+
+  port := getenv("PORT", "8080")
+  addr := ":" + port
+
+  app.addLog("INFO", "Server started", map[string]any{
+    "address": addr,
+  })
+
+  log.Printf("server listening on http://localhost%s", addr)
+  log.Fatal(http.ListenAndServe(addr, mux))
+}
+
+func (a *App) handleIndex(w http.ResponseWriter, r *http.Request) {
+  if r.URL.Path != "/" {
+    http.NotFound(w, r)
+    return
+  }
+
+  html, err := staticFiles.ReadFile("static/index.html")
+  if err != nil {
+    http.Error(w, "index.html not found", http.StatusInternalServerError)
+    return
+  }
+
+  w.Header().Set("Content-Type", "text/html; charset=utf-8")
+  _, _ = w.Write(html)
+}
+
+func (a *App) handleHealth(w http.ResponseWriter, r *http.Request) {
+  writeJSON(w, http.StatusOK, map[string]any{
+    "status": "ok",
+    "time":   time.Now().Format(time.RFC3339),
+  })
+}
+
+func (a *App) handleLogs(w http.ResponseWriter, r *http.Request) {
+  a.mu.Lock()
+  defer a.mu.Unlock()
+
+  copyLogs := make([]ActivityLog, len(a.logs))
+  copy(copyLogs, a.logs)
+
+  writeJSON(w, http.StatusOK, copyLogs)
+}
+
+func (a *App) handleStartExecution(w http.ResponseWriter, r *http.Request) {
+  var req StartRequest
+
+  if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+    a.addLog("ERROR", "Invalid request JSON", map[string]any{
+      "error": err.Error(),
+    })
+    writeError(w, http.StatusBadRequest, "invalid JSON request")
+    return
+  }
+
+  if strings.TrimSpace(req.StateMachineArn) == "" {
+    writeError(w, http.StatusBadRequest, "stateMachineArn is required")
+    return
+  }
+
+  if !a.isAllowed(req.StateMachineArn) {
+    a.addLog("WARN", "Rejected unauthorized state machine ARN", map[string]any{
+      "stateMachineArn": req.StateMachineArn,
+    })
+    writeError(w, http.StatusForbidden, "state machine ARN is not allowed")
+    return
+  }
+
+  inputBytes, err := json.Marshal(req.Input)
+  if err != nil {
+    writeError(w, http.StatusBadRequest, "input could not be marshaled as JSON")
+    return
+  }
+
+  startInput := &sfn.StartExecutionInput{
+    StateMachineArn: aws.String(req.StateMachineArn),
+    Input:           aws.String(string(inputBytes)),
+  }
+
+  if strings.TrimSpace(req.ExecutionName) != "" {
+    startInput.Name = aws.String(strings.TrimSpace(req.ExecutionName))
+  }
+
+  a.addLog("INFO", "Starting Step Functions execution", map[string]any{
+    "stateMachineArn": req.StateMachineArn,
+    "input":           string(inputBytes),
+  })
+
+  ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+  defer cancel()
+
+  out, err := a.sfnClient.StartExecution(ctx, startInput)
+  if err != nil {
+    a.addLog("ERROR", "Step Functions StartExecution failed", map[string]any{
+      "stateMachineArn": req.StateMachineArn,
+      "error":           err.Error(),
+    })
+    writeError(w, http.StatusInternalServerError, fmt.Sprintf("StartExecution failed: %v", err))
+    return
+  }
+
+  startDate := ""
+  if out.StartDate != nil {
+    startDate = out.StartDate.Format(time.RFC3339)
+  }
+
+  resp := StartResponse{
+    ExecutionArn: aws.ToString(out.ExecutionArn),
+    StartDate:    startDate,
+  }
+
+  a.addLog("INFO", "Step Functions execution started", map[string]any{
+    "executionArn": resp.ExecutionArn,
+    "startDate":    resp.StartDate,
+  })
+
+  writeJSON(w, http.StatusOK, resp)
+}
+
+func (a *App) isAllowed(arn string) bool {
+  if len(a.allowed) == 0 {
+    return true
+  }
+  return a.allowed[arn]
+}
+
+func (a *App) addLog(level, message string, fields map[string]any) {
+  a.mu.Lock()
+  defer a.mu.Unlock()
+
+  a.logs = append(a.logs, ActivityLog{
+    Time:    time.Now().Format(time.RFC3339),
+    Level:   level,
+    Message: message,
+    Fields:  fields,
+  })
+
+  if len(a.logs) > 200 {
+    a.logs = a.logs[len(a.logs)-200:]
+  }
+}
+
+func loadAllowedStateMachines() map[string]bool {
+  raw := strings.TrimSpace(os.Getenv("ALLOWED_STATE_MACHINE_ARNS"))
+  allowed := make(map[string]bool)
+
+  if raw == "" {
+    return allowed
+  }
+
+  for _, arn := range strings.Split(raw, ",") {
+    arn = strings.TrimSpace(arn)
+    if arn != "" {
+      allowed[arn] = true
+    }
+  }
+
+  return allowed
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+  w.Header().Set("Content-Type", "application/json")
+  w.WriteHeader(status)
+  _ = json.NewEncoder(w).Encode(v)
+}
+
+func writeError(w http.ResponseWriter, status int, message string) {
+  writeJSON(w, status, map[string]any{
+    "error": message,
+  })
+}
+
+func getenv(key, fallback string) string {
+  val := strings.TrimSpace(os.Getenv(key))
+  if val == "" {
+    return fallback
+  }
+  return val
+}
+
+
+=====
+You are an AWS tools developer. Use AWS Go SDK.
+The go application will launch a server with a front end.
+The user interface will be used to launch a step function.
+A form will be used to submit step function and JSON key values.
+Input will be converted to JSON values.
+Activity log will be displayed on the page.
+Worked for 28s
+
+Below is a small Go web application using AWS SDK for Go v2. It serves a frontend, accepts a Step Functions ARN plus key/value inputs, converts the form into JSON, starts the Step Functions execution, and displays an activity log.
+
+AWS SDK for Go v2 can load credentials and region from the normal AWS credential/config chain using config.LoadDefaultConfig. Step Functions executions are started through the StartExecution API, which accepts a state machine ARN and JSON input.
+
+Project layout
+sfn-launcher/
+  go.mod
+  main.go
+  static/
+    index.html
+go.mod
+module sfn-launcher
+
+go 1.23
+
+Then install dependencies:
+
+go get github.com/aws/aws-sdk-go-v2/config
+go get github.com/aws/aws-sdk-go-v2/service/sfn
+go mod tidy
+main.go
+package main
+
+import (
+  "context"
+  "embed"
+  "encoding/json"
+  "fmt"
+  "log"
+  "net/http"
+  "os"
+  "strings"
+  "sync"
+  "time"
+
+  "github.com/aws/aws-sdk-go-v2/aws"
+  "github.com/aws/aws-sdk-go-v2/config"
+  "github.com/aws/aws-sdk-go-v2/service/sfn"
+)
+
+//go:embed static/index.html
+var staticFiles embed.FS
+
+type App struct {
+  sfnClient *sfn.Client
+  allowed  map[string]bool
+
+  mu   sync.Mutex
+  logs []ActivityLog
+}
+
+type StartRequest struct {
+  StateMachineArn string         `json:"stateMachineArn"`
+  ExecutionName   string         `json:"executionName,omitempty"`
+  Input           map[string]any `json:"input"`
+}
+
+type StartResponse struct {
+  ExecutionArn string `json:"executionArn"`
+  StartDate    string `json:"startDate"`
+}
+
+type ActivityLog struct {
+  Time    string         `json:"time"`
+  Level   string         `json:"level"`
+  Message string         `json:"message"`
+  Fields  map[string]any `json:"fields,omitempty"`
+}
+
+func main() {
+  ctx := context.Background()
+
+  cfg, err := config.LoadDefaultConfig(ctx)
+  if err != nil {
+    log.Fatalf("failed to load AWS config: %v", err)
+  }
+
+  app := &App{
+    sfnClient: sfn.NewFromConfig(cfg),
+    allowed:  loadAllowedStateMachines(),
+    logs:     make([]ActivityLog, 0, 100),
+  }
+
+  if len(app.allowed) == 0 {
+    app.addLog("WARN", "No ALLOWED_STATE_MACHINE_ARNS configured; any ARN submitted by the UI will be accepted", nil)
+  }
+
+  mux := http.NewServeMux()
+  mux.HandleFunc("/", app.handleIndex)
+  mux.HandleFunc("GET /api/health", app.handleHealth)
+  mux.HandleFunc("GET /api/logs", app.handleLogs)
+  mux.HandleFunc("POST /api/start", app.handleStartExecution)
+
+  port := getenv("PORT", "8080")
+  addr := ":" + port
+
+  app.addLog("INFO", "Server started", map[string]any{
+    "address": addr,
+  })
+
+  log.Printf("server listening on http://localhost%s", addr)
+  log.Fatal(http.ListenAndServe(addr, mux))
+}
+
+func (a *App) handleIndex(w http.ResponseWriter, r *http.Request) {
+  if r.URL.Path != "/" {
+    http.NotFound(w, r)
+    return
+  }
+
+  html, err := staticFiles.ReadFile("static/index.html")
+  if err != nil {
+    http.Error(w, "index.html not found", http.StatusInternalServerError)
+    return
+  }
+
+  w.Header().Set("Content-Type", "text/html; charset=utf-8")
+  _, _ = w.Write(html)
+}
+
+func (a *App) handleHealth(w http.ResponseWriter, r *http.Request) {
+  writeJSON(w, http.StatusOK, map[string]any{
+    "status": "ok",
+    "time":   time.Now().Format(time.RFC3339),
+  })
+}
+
+func (a *App) handleLogs(w http.ResponseWriter, r *http.Request) {
+  a.mu.Lock()
+  defer a.mu.Unlock()
+
+  copyLogs := make([]ActivityLog, len(a.logs))
+  copy(copyLogs, a.logs)
+
+  writeJSON(w, http.StatusOK, copyLogs)
+}
+
+func (a *App) handleStartExecution(w http.ResponseWriter, r *http.Request) {
+  var req StartRequest
+
+  if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+    a.addLog("ERROR", "Invalid request JSON", map[string]any{
+      "error": err.Error(),
+    })
+    writeError(w, http.StatusBadRequest, "invalid JSON request")
+    return
+  }
+
+  if strings.TrimSpace(req.StateMachineArn) == "" {
+    writeError(w, http.StatusBadRequest, "stateMachineArn is required")
+    return
+  }
+
+  if !a.isAllowed(req.StateMachineArn) {
+    a.addLog("WARN", "Rejected unauthorized state machine ARN", map[string]any{
+      "stateMachineArn": req.StateMachineArn,
+    })
+    writeError(w, http.StatusForbidden, "state machine ARN is not allowed")
+    return
+  }
+
+  inputBytes, err := json.Marshal(req.Input)
+  if err != nil {
+    writeError(w, http.StatusBadRequest, "input could not be marshaled as JSON")
+    return
+  }
+
+  startInput := &sfn.StartExecutionInput{
+    StateMachineArn: aws.String(req.StateMachineArn),
+    Input:           aws.String(string(inputBytes)),
+  }
+
+  if strings.TrimSpace(req.ExecutionName) != "" {
+    startInput.Name = aws.String(strings.TrimSpace(req.ExecutionName))
+  }
+
+  a.addLog("INFO", "Starting Step Functions execution", map[string]any{
+    "stateMachineArn": req.StateMachineArn,
+    "input":           string(inputBytes),
+  })
+
+  ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+  defer cancel()
+
+  out, err := a.sfnClient.StartExecution(ctx, startInput)
+  if err != nil {
+    a.addLog("ERROR", "Step Functions StartExecution failed", map[string]any{
+      "stateMachineArn": req.StateMachineArn,
+      "error":           err.Error(),
+    })
+    writeError(w, http.StatusInternalServerError, fmt.Sprintf("StartExecution failed: %v", err))
+    return
+  }
+
+  startDate := ""
+  if out.StartDate != nil {
+    startDate = out.StartDate.Format(time.RFC3339)
+  }
+
+  resp := StartResponse{
+    ExecutionArn: aws.ToString(out.ExecutionArn),
+    StartDate:    startDate,
+  }
+
+  a.addLog("INFO", "Step Functions execution started", map[string]any{
+    "executionArn": resp.ExecutionArn,
+    "startDate":    resp.StartDate,
+  })
+
+  writeJSON(w, http.StatusOK, resp)
+}
+
+func (a *App) isAllowed(arn string) bool {
+  if len(a.allowed) == 0 {
+    return true
+  }
+  return a.allowed[arn]
+}
+
+func (a *App) addLog(level, message string, fields map[string]any) {
+  a.mu.Lock()
+  defer a.mu.Unlock()
+
+  a.logs = append(a.logs, ActivityLog{
+    Time:    time.Now().Format(time.RFC3339),
+    Level:   level,
+    Message: message,
+    Fields:  fields,
+  })
+
+  if len(a.logs) > 200 {
+    a.logs = a.logs[len(a.logs)-200:]
+  }
+}
+
+func loadAllowedStateMachines() map[string]bool {
+  raw := strings.TrimSpace(os.Getenv("ALLOWED_STATE_MACHINE_ARNS"))
+  allowed := make(map[string]bool)
+
+  if raw == "" {
+    return allowed
+  }
+
+  for _, arn := range strings.Split(raw, ",") {
+    arn = strings.TrimSpace(arn)
+    if arn != "" {
+      allowed[arn] = true
+    }
+  }
+
+  return allowed
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+  w.Header().Set("Content-Type", "application/json")
+  w.WriteHeader(status)
+  _ = json.NewEncoder(w).Encode(v)
+}
+
+func writeError(w http.ResponseWriter, status int, message string) {
+  writeJSON(w, status, map[string]any{
+    "error": message,
+  })
+}
+
+func getenv(key, fallback string) string {
+  val := strings.TrimSpace(os.Getenv(key))
+  if val == "" {
+    return fallback
+  }
+  return val
+}
+static/index.html
+
+IAM policy for the application role/user
+
+Restrict the resource to only the state machines this tool may launch.
+
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "StartAllowedStepFunctions",
+      "Effect": "Allow",
+      "Action": [
+        "states:StartExecution"
+      ],
+      "Resource": [
+        "arn:aws:states:us-east-1:123456789012:stateMachine:my-state-machine"
+      ]
+    }
+  ]
+}
+
+export AWS_PROFILE=my-sso-profile
+export AWS_REGION=us-east-1
+
+export ALLOWED_STATE_MACHINE_ARNS=arn:aws:states:us-east-1:123456789012:stateMachine:my-state-machine
+
+go run .
+
+http://localhost:8080
+-----
+Add Lambda support as a second launch type.
+go get github.com/aws/aws-sdk-go-v2/service/lambda
+go mod tidy
+
+
+Updated main.go
+
+This keeps the existing Step Functions support and adds:
+
+package main
+
+import (
+  "context"
+  "embed"
+  "encoding/base64"
+  "encoding/json"
+  "fmt"
+  "log"
+  "net/http"
+  "os"
+  "strings"
+  "sync"
+  "time"
+
+  "github.com/aws/aws-sdk-go-v2/aws"
+  "github.com/aws/aws-sdk-go-v2/config"
+  awslambda "github.com/aws/aws-sdk-go-v2/service/lambda"
+  lambdatypes "github.com/aws/aws-sdk-go-v2/service/lambda/types"
+  "github.com/aws/aws-sdk-go-v2/service/sfn"
+)
+
+//go:embed static/index.html
+var staticFiles embed.FS
+
+type App struct {
+  sfnClient    *sfn.Client
+  lambdaClient *awslambda.Client
+
+  allowedStateMachines map[string]bool
+  allowedLambdas       map[string]bool
+
+  mu   sync.Mutex
+  logs []ActivityLog
+}
+
+type SFNStartRequest struct {
+  StateMachineArn string         `json:"stateMachineArn"`
+  ExecutionName   string         `json:"executionName,omitempty"`
+  Input           map[string]any `json:"input"`
+}
+
+type SFNStartResponse struct {
+  ExecutionArn string `json:"executionArn"`
+  StartDate    string `json:"startDate"`
+}
+
+type LambdaInvokeRequest struct {
+  FunctionName   string         `json:"functionName"`
+  Qualifier      string         `json:"qualifier,omitempty"`
+  InvocationType string         `json:"invocationType"` // RequestResponse, Event, DryRun
+  LogTail         bool           `json:"logTail"`
+  Payload         map[string]any `json:"payload"`
+}
+
+type LambdaInvokeResponse struct {
+  StatusCode      int32  `json:"statusCode"`
+  FunctionError  string `json:"functionError,omitempty"`
+  ExecutedVersion string `json:"executedVersion,omitempty"`
+  Payload         string `json:"payload,omitempty"`
+  LogTail         string `json:"logTail,omitempty"`
+}
+
+type ActivityLog struct {
+  Time    string         `json:"time"`
+  Level   string         `json:"level"`
+  Message string         `json:"message"`
+  Fields  map[string]any `json:"fields,omitempty"`
+}
+
+func main() {
+  ctx := context.Background()
+
+  cfg, err := config.LoadDefaultConfig(ctx)
+  if err != nil {
+    log.Fatalf("failed to load AWS config: %v", err)
+  }
+
+  app := &App{
+    sfnClient:            sfn.NewFromConfig(cfg),
+    lambdaClient:         awslambda.NewFromConfig(cfg),
+    allowedStateMachines: loadAllowedList("ALLOWED_STATE_MACHINE_ARNS"),
+    allowedLambdas:       loadAllowedList("ALLOWED_LAMBDA_FUNCTIONS"),
+    logs:                 make([]ActivityLog, 0, 200),
+  }
+
+  if len(app.allowedStateMachines) == 0 {
+    app.addLog("WARN", "No ALLOWED_STATE_MACHINE_ARNS configured; any state machine ARN will be accepted", nil)
+  }
+
+  if len(app.allowedLambdas) == 0 {
+    app.addLog("WARN", "No ALLOWED_LAMBDA_FUNCTIONS configured; any Lambda function name or ARN will be accepted", nil)
+  }
+
+  mux := http.NewServeMux()
+  mux.HandleFunc("/", app.handleIndex)
+  mux.HandleFunc("GET /api/health", app.handleHealth)
+  mux.HandleFunc("GET /api/logs", app.handleLogs)
+  mux.HandleFunc("POST /api/sfn/start", app.handleStartSFNExecution)
+  mux.HandleFunc("POST /api/lambda/invoke", app.handleInvokeLambda)
+
+  port := getenv("PORT", "8080")
+  addr := ":" + port
+
+  app.addLog("INFO", "Server started", map[string]any{
+    "address": addr,
+  })
+
+  log.Printf("server listening on http://localhost%s", addr)
+  log.Fatal(http.ListenAndServe(addr, mux))
+}
+
+func (a *App) handleIndex(w http.ResponseWriter, r *http.Request) {
+  if r.URL.Path != "/" {
+    http.NotFound(w, r)
+    return
+  }
+
+  html, err := staticFiles.ReadFile("static/index.html")
+  if err != nil {
+    http.Error(w, "index.html not found", http.StatusInternalServerError)
+    return
+  }
+
+  w.Header().Set("Content-Type", "text/html; charset=utf-8")
+  _, _ = w.Write(html)
+}
+
+func (a *App) handleHealth(w http.ResponseWriter, r *http.Request) {
+  writeJSON(w, http.StatusOK, map[string]any{
+    "status": "ok",
+    "time":   time.Now().Format(time.RFC3339),
+  })
+}
+
+func (a *App) handleLogs(w http.ResponseWriter, r *http.Request) {
+  a.mu.Lock()
+  defer a.mu.Unlock()
+
+  copyLogs := make([]ActivityLog, len(a.logs))
+  copy(copyLogs, a.logs)
+
+  writeJSON(w, http.StatusOK, copyLogs)
+}
+
+func (a *App) handleStartSFNExecution(w http.ResponseWriter, r *http.Request) {
+  var req SFNStartRequest
+
+  if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+    a.addLog("ERROR", "Invalid Step Functions request JSON", map[string]any{
+      "error": err.Error(),
+    })
+    writeError(w, http.StatusBadRequest, "invalid JSON request")
+    return
+  }
+
+  req.StateMachineArn = strings.TrimSpace(req.StateMachineArn)
+
+  if req.StateMachineArn == "" {
+    writeError(w, http.StatusBadRequest, "stateMachineArn is required")
+    return
+  }
+
+  if !a.isAllowed(a.allowedStateMachines, req.StateMachineArn) {
+    a.addLog("WARN", "Rejected unauthorized Step Functions state machine", map[string]any{
+      "stateMachineArn": req.StateMachineArn,
+    })
+    writeError(w, http.StatusForbidden, "state machine ARN is not allowed")
+    return
+  }
+
+  inputBytes, err := json.Marshal(req.Input)
+  if err != nil {
+    writeError(w, http.StatusBadRequest, "input could not be marshaled as JSON")
+    return
+  }
+
+  startInput := &sfn.StartExecutionInput{
+    StateMachineArn: aws.String(req.StateMachineArn),
+    Input:           aws.String(string(inputBytes)),
+  }
+
+  if strings.TrimSpace(req.ExecutionName) != "" {
+    startInput.Name = aws.String(strings.TrimSpace(req.ExecutionName))
+  }
+
+  a.addLog("INFO", "Starting Step Functions execution", map[string]any{
+    "stateMachineArn": req.StateMachineArn,
+    "input":           string(inputBytes),
+  })
+
+  ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+  defer cancel()
+
+  out, err := a.sfnClient.StartExecution(ctx, startInput)
+  if err != nil {
+    a.addLog("ERROR", "Step Functions StartExecution failed", map[string]any{
+      "stateMachineArn": req.StateMachineArn,
+      "error":           err.Error(),
+    })
+    writeError(w, http.StatusInternalServerError, fmt.Sprintf("StartExecution failed: %v", err))
+    return
+  }
+
+  startDate := ""
+  if out.StartDate != nil {
+    startDate = out.StartDate.Format(time.RFC3339)
+  }
+
+  resp := SFNStartResponse{
+    ExecutionArn: aws.ToString(out.ExecutionArn),
+    StartDate:    startDate,
+  }
+
+  a.addLog("INFO", "Step Functions execution started", map[string]any{
+    "executionArn": resp.ExecutionArn,
+    "startDate":    resp.StartDate,
+  })
+
+  writeJSON(w, http.StatusOK, resp)
+}
+
+func (a *App) handleInvokeLambda(w http.ResponseWriter, r *http.Request) {
+  var req LambdaInvokeRequest
+
+  if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+    a.addLog("ERROR", "Invalid Lambda request JSON", map[string]any{
+      "error": err.Error(),
+    })
+    writeError(w, http.StatusBadRequest, "invalid JSON request")
+    return
+  }
+
+  req.FunctionName = strings.TrimSpace(req.FunctionName)
+
+  if req.FunctionName == "" {
+    writeError(w, http.StatusBadRequest, "functionName is required")
+    return
+  }
+
+  if !a.isAllowed(a.allowedLambdas, req.FunctionName) {
+    a.addLog("WARN", "Rejected unauthorized Lambda function", map[string]any{
+      "functionName": req.FunctionName,
+    })
+    writeError(w, http.StatusForbidden, "Lambda function is not allowed")
+    return
+  }
+
+  invocationType, err := parseInvocationType(req.InvocationType)
+  if err != nil {
+    writeError(w, http.StatusBadRequest, err.Error())
+    return
+  }
+
+  payloadBytes, err := json.Marshal(req.Payload)
+  if err != nil {
+    writeError(w, http.StatusBadRequest, "payload could not be marshaled as JSON")
+    return
+  }
+
+  invokeInput := &awslambda.InvokeInput{
+    FunctionName:   aws.String(req.FunctionName),
+    InvocationType: invocationType,
+    Payload:        payloadBytes,
+  }
+
+  if strings.TrimSpace(req.Qualifier) != "" {
+    invokeInput.Qualifier = aws.String(strings.TrimSpace(req.Qualifier))
+  }
+
+  if req.LogTail && invocationType == lambdatypes.InvocationTypeRequestResponse {
+    invokeInput.LogType = lambdatypes.LogTypeTail
+  }
+
+  a.addLog("INFO", "Invoking Lambda function", map[string]any{
+    "functionName":   req.FunctionName,
+    "qualifier":      req.Qualifier,
+    "invocationType": string(invocationType),
+    "payload":        string(payloadBytes),
+  })
+
+  ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+  defer cancel()
+
+  out, err := a.lambdaClient.Invoke(ctx, invokeInput)
+  if err != nil {
+    a.addLog("ERROR", "Lambda Invoke failed", map[string]any{
+      "functionName": req.FunctionName,
+      "error":        err.Error(),
+    })
+    writeError(w, http.StatusInternalServerError, fmt.Sprintf("Lambda Invoke failed: %v", err))
+    return
+  }
+
+  resp := LambdaInvokeResponse{
+    StatusCode:      out.StatusCode,
+    FunctionError:  aws.ToString(out.FunctionError),
+    ExecutedVersion: aws.ToString(out.ExecutedVersion),
+    Payload:         string(out.Payload),
+  }
+
+  if out.LogResult != nil && aws.ToString(out.LogResult) != "" {
+    decoded, err := base64.StdEncoding.DecodeString(aws.ToString(out.LogResult))
+    if err == nil {
+      resp.LogTail = string(decoded)
+    } else {
+      resp.LogTail = aws.ToString(out.LogResult)
+    }
+  }
+
+  fields := map[string]any{
+    "functionName":   req.FunctionName,
+    "invocationType": string(invocationType),
+    "statusCode":     resp.StatusCode,
+  }
+
+  if resp.FunctionError != "" {
+    fields["functionError"] = resp.FunctionError
+  }
+
+  a.addLog("INFO", "Lambda invocation completed", fields)
+
+  writeJSON(w, http.StatusOK, resp)
+}
+
+func parseInvocationType(value string) (lambdatypes.InvocationType, error) {
+  switch strings.TrimSpace(value) {
+  case "", "RequestResponse":
+    return lambdatypes.InvocationTypeRequestResponse, nil
+  case "Event":
+    return lambdatypes.InvocationTypeEvent, nil
+  case "DryRun":
+    return lambdatypes.InvocationTypeDryRun, nil
+  default:
+    return "", fmt.Errorf("invalid invocationType: must be RequestResponse, Event, or DryRun")
+  }
+}
+
+func (a *App) isAllowed(allowed map[string]bool, value string) bool {
+  if len(allowed) == 0 {
+    return true
+  }
+  return allowed[value]
+}
+
+func (a *App) addLog(level, message string, fields map[string]any) {
+  a.mu.Lock()
+  defer a.mu.Unlock()
+
+  a.logs = append(a.logs, ActivityLog{
+    Time:    time.Now().Format(time.RFC3339),
+    Level:   level,
+    Message: message,
+    Fields:  fields,
+  })
+
+  if len(a.logs) > 200 {
+    a.logs = a.logs[len(a.logs)-200:]
+  }
+}
+
+func loadAllowedList(envName string) map[string]bool {
+  raw := strings.TrimSpace(os.Getenv(envName))
+  allowed := make(map[string]bool)
+
+  if raw == "" {
+    return allowed
+  }
+
+  for _, item := range strings.Split(raw, ",") {
+    item = strings.TrimSpace(item)
+    if item != "" {
+      allowed[item] = true
+    }
+  }
+
+  return allowed
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+  w.Header().Set("Content-Type", "application/json")
+  w.WriteHeader(status)
+  _ = json.NewEncoder(w).Encode(v)
+}
+
+func writeError(w http.ResponseWriter, status int, message string) {
+  writeJSON(w, status, map[string]any{
+    "error": message,
+  })
+}
+
+func getenv(key, fallback string) string {
+  val := strings.TrimSpace(os.Getenv(key))
+  if val == "" {
+    return fallback
+  }
+  return val
+}
+-----
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>AWS Workflow Launcher</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <style>
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      margin: 0;
+      background: #f5f5f5;
+      color: #222;
+    }
+
+    header {
+      background: #232f3e;
+      color: white;
+      padding: 1rem 2rem;
+    }
+
+    main {
+      max-width: 1100px;
+      margin: 2rem auto;
+      padding: 0 1rem;
+      display: grid;
+      gap: 1.5rem;
+    }
+
+    section {
+      background: white;
+      border: 1px solid #ddd;
+      border-radius: 10px;
+      padding: 1.25rem;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.06);
+    }
+
+    label {
+      display: block;
+      font-weight: 600;
+      margin-top: 1rem;
+      margin-bottom: 0.35rem;
+    }
+
+    input, select {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 0.6rem;
+      border: 1px solid #bbb;
+      border-radius: 6px;
+      font-size: 1rem;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 1rem;
+    }
+
+    th, td {
+      border-bottom: 1px solid #ddd;
+      padding: 0.5rem;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    button {
+      cursor: pointer;
+      border: 0;
+      border-radius: 6px;
+      padding: 0.7rem 1rem;
+      font-weight: 600;
+      background: #ff9900;
+      color: #111;
+    }
+
+    button.secondary {
+      background: #e9e9e9;
+    }
+
+    button.danger {
+      background: #cc3333;
+      color: white;
+    }
+
+    .actions {
+      display: flex;
+      gap: 0.75rem;
+      margin-top: 1rem;
+      flex-wrap: wrap;
+    }
+
+    pre {
+      background: #111;
+      color: #eee;
+      padding: 1rem;
+      border-radius: 8px;
+      overflow: auto;
+      min-height: 80px;
+    }
+
+    .log-entry {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      border-bottom: 1px solid #eee;
+      padding: 0.5rem 0;
+      white-space: pre-wrap;
+    }
+
+    .INFO { color: #0b5; }
+    .WARN { color: #b87300; }
+    .ERROR { color: #c33; }
+
+    .hidden {
+      display: none;
+    }
+  </style>
+</head>
+
+<body>
+<header>
+  <h1>AWS Workflow Launcher</h1>
+</header>
+
+<main>
+  <section>
+    <h2>Launch AWS target</h2>
+
+    <form id="launchForm">
+      <label for="targetType">Target Type</label>
+      <select id="targetType">
+        <option value="sfn">Step Functions</option>
+        <option value="lambda">Lambda</option>
+      </select>
+
+      <div id="sfnFields">
+        <label for="stateMachineArn">State Machine ARN</label>
+        <input
+          id="stateMachineArn"
+          placeholder="arn:aws:states:us-east-1:123456789012:stateMachine:my-state-machine"
+        />
+
+        <label for="executionName">Execution Name Optional</label>
+        <input
+          id="executionName"
+          placeholder="my-execution-name"
+        />
+      </div>
+
+      <div id="lambdaFields" class="hidden">
+        <label for="functionName">Lambda Function Name or ARN</label>
+        <input
+          id="functionName"
+          placeholder="my-function or arn:aws:lambda:us-east-1:123456789012:function:my-function"
+        />
+
+        <label for="qualifier">Qualifier Optional</label>
+        <input
+          id="qualifier"
+          placeholder="alias or version, for example prod or 3"
+        />
+
+        <label for="invocationType">Invocation Type</label>
+        <select id="invocationType">
+          <option value="RequestResponse">RequestResponse synchronous</option>
+          <option value="Event">Event asynchronous</option>
+          <option value="DryRun">DryRun permission check</option>
+        </select>
+
+        <label>
+          <input id="logTail" type="checkbox" style="width:auto" checked />
+          Include Lambda log tail for synchronous invocation
+        </label>
+      </div>
+
+      <h3>JSON Input / Payload</h3>
+      <p>
+        Use simple keys like <code>env</code>, or dotted keys like
+        <code>request.id</code> for nested JSON.
+      </p>
+
+      <table>
+        <thead>
+          <tr>
+            <th style="width: 30%">Key</th>
+            <th style="width: 20%">Type</th>
+            <th>Value</th>
+            <th style="width: 90px">Action</th>
+          </tr>
+        </thead>
+        <tbody id="kvRows"></tbody>
+      </table>
+
+      <div class="actions">
+        <button type="button" class="secondary" onclick="addRow()">Add key</button>
+        <button type="submit">Launch</button>
+      </div>
+    </form>
+  </section>
+
+  <section>
+    <h2>Generated JSON Preview</h2>
+    <pre id="jsonPreview">{}</pre>
+  </section>
+
+  <section>
+    <h2>Last Response</h2>
+    <pre id="responseOutput">No request submitted yet.</pre>
+  </section>
+
+  <section>
+    <h2>Activity Log</h2>
+    <div id="activityLog"></div>
+  </section>
+</main>
+
+<script>
+  const kvRows = document.getElementById("kvRows");
+  const jsonPreview = document.getElementById("jsonPreview");
+  const responseOutput = document.getElementById("responseOutput");
+  const activityLog = document.getElementById("activityLog");
+
+  const targetType = document.getElementById("targetType");
+  const sfnFields = document.getElementById("sfnFields");
+  const lambdaFields = document.getElementById("lambdaFields");
+
+  targetType.addEventListener("change", () => {
+    const isLambda = targetType.value === "lambda";
+    sfnFields.classList.toggle("hidden", isLambda);
+    lambdaFields.classList.toggle("hidden", !isLambda);
+  });
+
+  function addRow(key = "", type = "string", value = "") {
+    const tr = document.createElement("tr");
+
+    tr.innerHTML = `
+      <td><input class="kv-key" placeholder="request.id" value="${escapeHtml(key)}" /></td>
+      <td>
+        <select class="kv-type">
+          <option value="string">string</option>
+          <option value="number">number</option>
+          <option value="boolean">boolean</option>
+          <option value="json">json</option>
+          <option value="null">null</option>
+        </select>
+      </td>
+      <td><input class="kv-value" placeholder="value" value="${escapeHtml(value)}" /></td>
+      <td><button type="button" class="danger" onclick="this.closest('tr').remove(); updatePreview();">Remove</button></td>
+    `;
+
+    tr.querySelector(".kv-type").value = type;
+
+    tr.querySelectorAll("input, select").forEach(el => {
+      el.addEventListener("input", updatePreview);
+      el.addEventListener("change", updatePreview);
+    });
+
+    kvRows.appendChild(tr);
+    updatePreview();
+  }
+
+  function buildInputObject() {
+    const obj = {};
+    const rows = kvRows.querySelectorAll("tr");
+
+    rows.forEach(row => {
+      const key = row.querySelector(".kv-key").value.trim();
+      const type = row.querySelector(".kv-type").value;
+      const rawValue = row.querySelector(".kv-value").value;
+
+      if (!key) {
+        return;
+      }
+
+      const value = convertValue(type, rawValue);
+      setByDottedPath(obj, key, value);
+    });
+
+    return obj;
+  }
+
+  function convertValue(type, rawValue) {
+    switch (type) {
+      case "string":
+        return rawValue;
+
+      case "number": {
+        const n = Number(rawValue);
+        if (Number.isNaN(n)) {
+          throw new Error(`Invalid number: ${rawValue}`);
+        }
+        return n;
+      }
+
+      case "boolean": {
+        const normalized = rawValue.trim().toLowerCase();
+        if (["true", "yes", "1"].includes(normalized)) return true;
+        if (["false", "no", "0"].includes(normalized)) return false;
+        throw new Error(`Invalid boolean: ${rawValue}`);
+      }
+
+      case "json":
+        return JSON.parse(rawValue);
+
+      case "null":
+        return null;
+
+      default:
+        return rawValue;
+    }
+  }
+
+  function setByDottedPath(obj, path, value) {
+    const parts = path.split(".").map(p => p.trim()).filter(Boolean);
+    let current = obj;
+
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i];
+
+      if (i === parts.length - 1) {
+        current[part] = value;
+      } else {
+        if (
+          typeof current[part] !== "object" ||
+          current[part] === null ||
+          Array.isArray(current[part])
+        ) {
+          current[part] = {};
+        }
+        current = current[part];
+      }
+    }
+  }
+
+  function updatePreview() {
+    try {
+      const input = buildInputObject();
+      jsonPreview.textContent = JSON.stringify(input, null, 2);
+    } catch (err) {
+      jsonPreview.textContent = "Invalid input: " + err.message;
+    }
+  }
+
+  document.getElementById("launchForm").addEventListener("submit", async event => {
+    event.preventDefault();
+
+    try {
+      let endpoint;
+      let payload;
+
+      const inputObject = buildInputObject();
+
+      if (targetType.value === "sfn") {
+        endpoint = "/api/sfn/start";
+
+        payload = {
+          stateMachineArn: document.getElementById("stateMachineArn").value.trim(),
+          executionName: document.getElementById("executionName").value.trim(),
+          input: inputObject
+        };
+
+        appendLocalLog("INFO", "Submitting Step Functions execution request");
+      } else {
+        endpoint = "/api/lambda/invoke";
+
+        payload = {
+          functionName: document.getElementById("functionName").value.trim(),
+          qualifier: document.getElementById("qualifier").value.trim(),
+          invocationType: document.getElementById("invocationType").value,
+          logTail: document.getElementById("logTail").checked,
+          payload: inputObject
+        };
+
+        appendLocalLog("INFO", "Submitting Lambda invocation request");
+      }
+
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(payload)
+      });
+
+      const body = await res.json();
+
+      if (!res.ok) {
+        throw new Error(body.error || "request failed");
+      }
+
+      responseOutput.textContent = JSON.stringify(body, null, 2);
+      appendLocalLog("INFO", "AWS request completed");
+      await refreshLogs();
+
+    } catch (err) {
+      responseOutput.textContent = "Error: " + err.message;
+      appendLocalLog("ERROR", err.message);
+    }
+  });
+
+  async function refreshLogs() {
+    try {
+      const res = await fetch("/api/logs");
+      const logs = await res.json();
+
+      activityLog.innerHTML = "";
+
+      logs.slice().reverse().forEach(log => {
+        const div = document.createElement("div");
+        div.className = "log-entry " + log.level;
+
+        let line = `[${log.time}] ${log.level} ${log.message}`;
+        if (log.fields) {
+          line += "\n" + JSON.stringify(log.fields, null, 2);
+        }
+
+        div.textContent = line;
+        activityLog.appendChild(div);
+      });
+    } catch (err) {
+      appendLocalLog("ERROR", "Could not refresh server logs: " + err.message);
+    }
+  }
+
+  function appendLocalLog(level, message) {
+    const div = document.createElement("div");
+    div.className = "log-entry " + level;
+    div.textContent = `[${new Date().toISOString()}] ${level} ${message}`;
+    activityLog.prepend(div);
+  }
+
+  function escapeHtml(value) {
+    return String(value)
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;");
+  }
+
+  addRow("env", "string", "dev");
+  addRow("dryRun", "boolean", "true");
+  addRow("request.id", "string", "REQ-001");
+
+  setInterval(refreshLogs, 3000);
+  refreshLogs();
+</script>
+</body>
+</html>
+
