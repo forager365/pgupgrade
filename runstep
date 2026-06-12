@@ -1,0 +1,491 @@
+mkdir lambda-invoker
+cd lambda-invoker
+go mod init lambda-invoker
+
+# Install AWS SDK v2 core and Lambda packages
+go get github.com/aws/aws-sdk-go-v2
+go get github.com/aws/aws-sdk-go-v2/config
+go get github.com/aws/aws-sdk-go-v2/service/lambda
+
+This single file handles the AWS configuration, serves the HTML/JavaScript frontend, exposes an API endpoint to list available Lambdas, and processes the invocation request.
+
+
+package main
+
+import (
+  "context"
+  "encoding/json"
+  "fmt"
+  "html/template"
+  "log"
+  "net/http"
+  "time"
+
+  "github.com/aws/aws-sdk-go-v2/aws"
+  "github.com/aws/aws-sdk-go-v2/config"
+  "github.com/aws/aws-sdk-go-v2/service/lambda"
+  "github.com/aws/aws-sdk-go-v2/service/lambda/types"
+)
+
+// Global Lambda client wrapper
+type LambdaClient struct {
+  Client *lambda.Client
+}
+
+// Struct to parse incoming invocation requests from the UI
+type InvokeRequest struct {
+  FunctionName string            `json:"functionName"`
+  PayloadData  map[string]string `json:"payloadData"`
+}
+
+func main() {
+  // Initialize AWS Config (Loads from ~/.aws/credentials, config, or IAM Roles)
+  cfg, err := config.LoadDefaultConfig(context.TODO())
+  if err != nil {
+    log.Fatalf("unable to load SDK config, %v", err)
+  }
+
+  awsClient := &LambdaClient{
+    Client: lambda.NewFromConfig(cfg),
+  }
+
+  // Route Handlers
+  http.HandleFunc("/", handleHome)
+  http.HandleFunc("/api/functions", awsClient.handleListFunctions)
+  http.HandleFunc("/api/invoke", awsClient.handleInvoke)
+
+  serverAddr := ":8080"
+  fmt.Printf("🚀 Server started at http://localhost%s\n", serverAddr)
+  if err := http.ListenAndServe(serverAddr, nil); err != nil {
+    log.Fatalf("Server failed to start: %v", err)
+  }
+}
+
+// Serves the single-page frontend application
+func handleHome(w http.ResponseWriter, r *http.Request) {
+  tmpl := template.Must(template.New("index").Parse(htmlTemplate))
+  tmpl.Execute(w, nil)
+}
+
+// API: Lists the available Lambda functions in the configured region
+func (lc *LambdaClient) handleListFunctions(w http.ResponseWriter, r *http.Request) {
+  w.Header().Set("Content-Type", "application/json")
+  
+  paginator := lambda.NewListFunctionsPaginator(lc.Client, &lambda.ListFunctionsInput{})
+  var functions []string
+
+  for paginator.HasMorePages() {
+    page, err := paginator.NextPage(context.TODO())
+    if err != nil {
+      http.Error(w, fmt.Sprintf(`{"error": "%s"}`, err.Error()), http.StatusInternalServerError)
+      return
+    }
+    for _, f := range page.Functions {
+      functions = append(functions, *f.FunctionName)
+    }
+  }
+
+  json.NewEncoder(w).Encode(functions)
+}
+
+// API: Converts form key-values to JSON, invokes the Lambda, and extracts logs
+func (lc *LambdaClient) handleInvoke(w http.ResponseWriter, r *http.Request) {
+  w.Header().Set("Content-Type", "application/json")
+  if r.Method != http.MethodPost {
+    http.Error(w, `{"error": "Method not allowed"}`, http.StatusMethodNotAllowed)
+    return
+  }
+
+  var req InvokeRequest
+  if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+    http.Error(w, `{"error": "Invalid request body"}`, http.StatusBadRequest)
+    return
+  }
+
+  // Convert map[string]string payload to pure JSON bytes
+  payloadBytes, err := json.Marshal(req.PayloadData)
+  if err != nil {
+    http.Error(w, `{"error": "Failed to process JSON payload"}`, http.StatusInternalServerError)
+    return
+  }
+
+  startTime := time.Now()
+
+  // Invoke the Lambda Function
+  input := &lambda.InvokeInput{
+    FunctionName:   aws.String(req.FunctionName),
+    Payload:        payloadBytes,
+    LogType:        types.LogTypeTail, // Requests execution logs to be returned in the response
+  }
+
+  output, err := lc.Client.Invoke(context.TODO(), input)
+  duration := time.Since(startTime)
+
+  if err != nil {
+    http.Error(w, fmt.Sprintf(`{"error": "Lambda execution failed: %s"}`, err.Error()), http.StatusInternalServerError)
+    return
+  }
+
+  // Prepare standard execution metrics alongside AWS metadata payload
+  responseMap := map[string]interface{}{
+    "statusCode":   output.StatusCode,
+    "payload":      string(output.Payload),
+    "durationMs":   duration.Milliseconds(),
+  }
+
+  // If logs exist, they come back base64 encoded inside output.LogResult
+  if output.LogResult != nil {
+    responseMap["logResult"] = *output.LogResult
+  }
+  if output.FunctionError != nil {
+    responseMap["functionError"] = *output.FunctionError
+  }
+
+  json.NewEncoder(w).Encode(responseMap)
+}
+
+// Inline HTML/JS template using modern CSS/JS for an elegant Dashboard UI
+const htmlTemplate = `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AWS Lambda Orchestration Dashboard</title>
+    <style>
+        :root { --bg: #0f172a; --panel: #1e293b; --text: #f8fafc; --accent: #3b82f6; --success: #10b981; --border: #334155; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 2rem; }
+        .container { max-width: 1100px; margin: 0 auto; display: grid; grid-template-columns: 1fr 1fr; gap: 2rem; }
+        header { grid-column: span 2; margin-bottom: 1rem; border-bottom: 1px solid var(--border); padding-bottom: 1rem; }
+        h1 { margin: 0; font-size: 1.75rem; color: #fff; }
+        .panel { background: var(--panel); padding: 1.5rem; border-radius: 8px; border: 1px solid var(--border); box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1); }
+        h2 { font-size: 1.2rem; margin-top: 0; color: #94a3b8; border-bottom: 1px solid var(--border); padding-bottom: 0.5rem;}
+        .form-group { margin-bottom: 1.25rem; }
+        label { display: block; margin-bottom: 0.5rem; font-weight: 500; font-size: 0.9rem; color: #cbd5e1; }
+        select, input { wIDth: 100%; padding: 0.6rem; background: var(--bg); border: 1px solid var(--border); color: #fff; border-radius: 4px; box-sizing: border-box; font-family: inherit; }
+        select:focus, input:focus { border-color: var(--accent); outline: none; }
+        .kv-row { display: flex; gap: 0.5rem; margin-bottom: 0.5rem; }
+        button { background: var(--accent); color: #fff; border: none; padding: 0.6rem 1.2rem; border-radius: 4px; font-weight: 600; cursor: pointer; transition: background 0.2s; }
+        button:hover { background: #2563eb; }
+        .btn-sec { background: transparent; border: 1px solid var(--border); color: #cbd5e1; }
+        .btn-sec:hover { background: var(--border); }
+        .btn-success { background: var(--success); wIDth: 100%; margin-top: 1rem; font-size: 1rem; padding: 0.75rem; }
+        .btn-success:hover { background: #059669; }
+        #log-area { background: #020617; border: 1px solid var(--border); border-radius: 4px; padding: 1rem; height: 450px; overflow-y: auto; font-family: "SFMono-Regular", Consolas, monospace; font-size: 0.85rem; white-space: pre-wrap; box-sizing: border-box; }
+        .log-entry { margin-bottom: 0.75rem; border-left: 3px solid #64748b; padding-left: 0.5rem; }
+        .log-entry.info { border-color: var(--accent); }
+        .log-entry.success { border-color: var(--success); }
+        .log-entry.error { border-color: #ef4444; color: #fca5a5; }
+        .timestamp { color: #64748b; font-size: 0.75rem; margin-bottom: 0.2rem; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <header>
+        <h1>AWS Lambda Invoker Interface</h1>
+    </header>
+
+    <div class="panel">
+        <h2>Configuration</h2>
+        <div class="form-group">
+            <label for="lambda-select">Select Target Lambda Function</label>
+            <select id="lambda-select">
+                <option value="">-- Fetching functions... --</option>
+            </select>
+        </div>
+
+        <div class="form-group">
+            <label>JSON Payload Parameters (Key / Value Pairs)</label>
+            <div id="kv-container">
+                <div class="kv-row">
+                    <input type="text" placeholder="key" class="kv-key">
+                    <input type="text" placeholder="value" class="kv-value">
+                </div>
+            </div>
+            <button type="button" class="btn-sec" onclick="addKeyValuePair()" style="margin-top: 0.5rem; font-size: 0.8rem;">+ Add Parameter</button>
+        </div>
+
+        <button class="button btn-success" onclick="invokeLambda()">Execute Lambda Function</button>
+    </div>
+
+    <div class="panel">
+        <h2>Execution Activity Log</h2>
+        <div id="log-area"><div class="log-entry info"><div class="timestamp">System</div>Dashboard loaded. Awaiting instructions...</div></div>
+    </div>
+</div>
+
+<script>
+    document.addEventListener('DOMContentLoaded', fetchFunctions);
+
+    // Dynamic key-value inputs generator
+    function addKeyValuePair() {
+        const container = document.getElementById('kv-container');
+        const row = document.createElement('div');
+        row.className = 'kv-row';
+        row.innerHTML = `
+            <input type="text" placeholder="key" class="kv-key">
+            <input type="text" placeholder="value" class="kv-value">
+        `;
+        container.appendChild(row);
+    }
+
+    function appendLog(message, type = 'info') {
+        const logArea = document.getElementById('log-area');
+        const entry = document.createElement('div');
+        entry.className = `log-entry ${type}`;
+        
+        const timestamp = document.createElement('div');
+        timestamp.className = 'timestamp';
+        timestamp.innerText = new Date().toLocaleTimeString();
+        
+        const text = document.createElement('div');
+        text.innerText = message;
+        
+        entry.appendChild(timestamp);
+        entry.appendChild(text);
+        logArea.appendChild(entry);
+        logArea.scrollTop = logArea.scrollHeight;
+    }
+
+    // Load available functions into dropdown
+    async function fetchFunctions() {
+        try {
+            const res = await fetch('/api/functions');
+            const functions = await res.json();
+            const select = document.getElementById('lambda-select');
+            select.innerHTML = '';
+            
+            if (!functions || functions.length === 0) {
+                select.innerHTML = '<option value="">No Lambdas discovered in region</option>';
+                return;
+            }
+            
+            functions.forEach(f => {
+                const opt = document.createElement('option');
+                opt.value = f;
+                opt.textContent = f;
+                select.appendChild(opt);
+            });
+            appendLog('Successfully polled AWS account functions metadata.');
+        } catch (err) {
+            appendLog('Error querying Lambda Functions collection: ' + err, 'error');
+        }
+    }
+
+    // Process payload maps and trigger runtime request
+    async function invokeLambda() {
+        const functionName = document.getElementById('lambda-select').value;
+        if (!functionName) {
+            alert('Please select a target Lambda function first.');
+            return;
+        }
+
+        // Aggregate current UI dynamic fields into structural map object
+        const keys = document.querySelectorAll('.kv-key');
+        const values = document.querySelectorAll('.kv-value');
+        const payloadData = {};
+
+        keys.forEach((keyEl, index) => {
+            const k = keyEl.value.trim();
+            const v = values[index].value.trim();
+            if (k) payloadData[k] = v;
+        });
+
+        appendLog(`Assembling Payload Map & Invoking ${functionName}...`, 'info');
+
+        try {
+            const response = await fetch('/api/invoke', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ functionName, payloadData })
+            });
+
+            const result = await response.json();
+
+            if (!response.ok) {
+                appendLog(`HTTP Error Status [${response.status}]: ${result.error}`, 'error');
+                return;
+            }
+
+            appendLog(`Invocation completed in ${result.durationMs}ms with Status Code: ${result.statusCode}`, 'success');
+            
+            if (result.functionError) {
+                appendLog(`Lambda Execution Context Exception: ${result.functionError}`, 'error');
+            }
+
+            appendLog(`Returned Payload Data Output:\n${result.payload}`, 'success');
+
+            // Handle AWS Base64 Tail Logs if returned
+            if (result.logResult) {
+                try {
+                    const rawLogs = atob(result.logResult);
+                    appendLog(`=== AWS CloudWatch Cloud Tail Logs ===\n${rawLogs}`, 'info');
+                } catch(e) {
+                    appendLog('Could not decode Tail CloudWatch Logs wrapper telemetry data.', 'error');
+                }
+            }
+
+        } catch (err) {
+            appendLog(`Network Exception Intercepted: ${err.message}`, 'error');
+        }
+    }
+</script>
+</body>
+</html>
+`
+export AWS_ACCESS_KEY_ID="your-access-key"
+export AWS_SECRET_ACCESS_KEY="your-secret-key"
+export AWS_REGION="us-east-1"
+
+go run main.go
+
+Interact with the App: Open your web browser and navigate to http://localhost:8080.
+
+The web page will automatically retrieve and populate the dropdown menu with all available Lambda functions located within your designated AWS region.
+
+Add arbitrary dynamic parameters using the form interface (e.g., Key: userId, Value: 42).
+
+Click Execute Lambda Function to view real-time data payloads and base64-decoded logs returned from CloudWatch directly inside the activity log panel.
+
+Yes, this pattern can absolutely be achieved directly within your Go application using the AWS SDK for Go v2.
+
+While AWS Step Functions handle this using a Task state with a polling or event-driven backoff loop behind the scenes, you can replicate this behavior in Go by utilizing two primary tools from the SDK:
+
+Asynchronous Lambda Invocation (using InvocationTypeEvent) so the Go application doesn't block on a long-running Lambda process.
+
+Built-in SDK Waiters or a custom polling loop with backoff to query the status of the RDS resource until it transitions to AVAILABLE.
+
+Here is how you can implement this architecture in Go.
+
+🏗️ Architecture Design Pattern
+Instead of invoking the Lambda synchronously (RequestResponse), you fire it asynchronously (Event). The Lambda triggers the creation of the RDS Blue/Green deployment and exits immediately. Your Go process then takes over the heavy lifting of polling the RDS API until the deployment is ready.
+
+Below is the complete implementation utilizing the AWS SDK for Go v2. It includes a custom polling function with exponential backoff to monitor the RDS Blue/Green deployment status.
+
+package main
+
+import (
+  "context"
+  "encoding/json"
+  "errors"
+  "fmt"
+  "log"
+  "time"
+
+  "github.com/aws/aws-sdk-go-v2/aws"
+  "github.com/aws/aws-sdk-go-v2/config"
+  "github.com/aws/aws-sdk-go-v2/service/lambda"
+  "github.com/aws/aws-sdk-go-v2/service/lambda/types"
+  "github.com/aws/aws-sdk-go-v2/service/rds"
+)
+
+type DeploymentPayload struct {
+  DeploymentName string `json:"deploymentName"`
+  SourceDBArn    string `json:"sourceDbArn"`
+  TargetVersion  string `json:"targetVersion"`
+}
+
+func main() {
+  ctx := context.TODO()
+  
+  // Initialize AWS Configuration
+  cfg, err := config.LoadDefaultConfig(ctx)
+  if err != nil {
+    log.Fatalf("failed to load SDK config: %v", err)
+  }
+
+  lambdaClient := lambda.NewFromConfig(cfg)
+  rdsClient := rds.NewFromConfig(cfg)
+
+  deploymentName := "pg-upgrade-deployment"
+  
+  // 1. Prepare payload for the automation Lambda
+  payload := DeploymentPayload{
+    DeploymentName: deploymentName,
+    SourceDBArn:    "arn:aws:rds:us-east-1:123456789012:db:production-postgres",
+    TargetVersion:  "17.1",
+  }
+  
+  payloadBytes, _ := json.Marshal(payload)
+
+  // 2. Invoke Lambda Asynchronously (Event Type)
+  fmt.Println("🚀 Triggering Lambda function to initiate Blue/Green environment...")
+  _, err = lambdaClient.Invoke(ctx, &lambda.InvokeInput{
+    FunctionName:   aws.String("InitiateBlueGreenDeploymentLambda"),
+    InvocationType: types.InvocationTypeEvent, // Asynchronous execution
+    Payload:        payloadBytes,
+  })
+  if err != nil {
+    log.Fatalf("Failed to invoke Lambda: %v", err)
+  }
+  fmt.Println("✅ Lambda invoked successfully. Handing off monitoring to the Go routine.")
+
+  // 3. Poll the RDS Resource state until it is available
+  fmt.Printf("⏳ Polling RDS Blue/Green deployment '%s' status...\n", deploymentName)
+  err = waitForBlueGreenDeployment(ctx, rdsClient, deploymentName, 30*time.Minute)
+  if err != nil {
+    log.Fatalf("❌ Error or timeout during deployment: %v", err)
+  }
+
+  fmt.Println("🎉 Success! The Blue/Green deployment is active and ready for switchover.")
+}
+
+// waitForBlueGreenDeployment blocks until the RDS B/G deployment status is 'AVAILABLE'
+func waitForBlueGreenDeployment(ctx context.Context, client *rds.Client, deploymentID string, timeout time.Duration) error {
+  ctx, cancel := context.WithTimeout(ctx, timeout)
+  defer cancel()
+
+  // Configure polling interval rules
+  baseDelay := 15 * time.Second
+  maxDelay := 2 * time.Minute
+  currentDelay := baseDelay
+
+  for {
+    select {
+    case <-ctx.Done():
+      return errors.New("polling timed out before deployment reached available state")
+    default:
+      // Query the specific Blue/Green deployment status
+      output, err := client.DescribeBlueGreenDeployments(ctx, &rds.DescribeBlueGreenDeploymentsInput{
+        BlueGreenDeploymentIdentifier: aws.String(deploymentID),
+      })
+      if err != nil {
+        fmt.Printf("⚠️ Warning: Error calling DescribeBlueGreenDeployments: %v. Retrying...\n", err)
+        goto WaitPhase
+      }
+
+      if len(output.BlueGreenDeployments) == 0 {
+        fmt.Println("⚠️ Target deployment not found yet. It might still be provisioning via Lambda...")
+        goto WaitPhase
+      }
+
+      // Capture the current status from the target deployment metadata
+      status := *output.BlueGreenDeployments[0].Status
+      fmt.Printf("[%s] Current Status: %s\n", time.Now().Format("15:04:05"), status)
+
+      switch status {
+      case "AVAILABLE", "PROVISIONING_COMPLETE": 
+        return nil
+      case "FAILED", "INSUFFICIENT_CAPACITY":
+        return fmt.Errorf("deployment entered a critical failure state: %s", status)
+      }
+
+    WaitPhase:
+      // Execute backoff sleep
+      time.Sleep(currentDelay)
+      
+      // Increment delay exponentially up to max boundary
+      currentDelay *= 2
+      if currentDelay > maxDelay {
+        currentDelay = maxDelay
+      }
+    }
+  }
+}
+
+types.InvocationTypeEvent: Essential for this architecture. When using this type, AWS accepts the payload immediately, registers an HTTP 202 status, and breaks the network connection so your web application frontend doesn't hang waiting for the Lambda execution timeline.
+
+Context Timeouts: Database environment configurations can take 15 to 45 minutes to stand up. Utilizing context.WithTimeout allows your application to fail gracefully if it exceeds your infrastructure SLA limits rather than looping endlessly.
+
+Exponential Backoff: Instead of hitting the RDS API continuously every second (which will trigger AWS API Rate Limiting / throttling), the loop multiplies the wait interval progressively until it reaches a stable 2-minute check cycle.
